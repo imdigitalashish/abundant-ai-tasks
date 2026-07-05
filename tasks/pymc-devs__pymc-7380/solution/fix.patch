@@ -1,0 +1,898 @@
+diff --git a/pymc/distributions/multivariate.py b/pymc/distributions/multivariate.py
+index dd7bd7c08..ba2f0e9f6 100644
+--- a/pymc/distributions/multivariate.py
++++ b/pymc/distributions/multivariate.py
+@@ -22,8 +22,7 @@ import pytensor.tensor as pt
+ import scipy
+ 
+ from pytensor.graph import node_rewriter
+-from pytensor.graph.basic import Apply, Variable
+-from pytensor.graph.op import Op
++from pytensor.graph.basic import Variable
+ from pytensor.raise_op import Assert
+ from pytensor.sparse.basic import DenseFromSparse
+ from pytensor.sparse.math import sp_sum
+@@ -44,7 +43,6 @@ from pytensor.tensor.random.op import RandomVariable
+ from pytensor.tensor.random.utils import (
+     normalize_size_param,
+ )
+-from pytensor.tensor.type import TensorType
+ from scipy import stats
+ 
+ import pymc as pm
+@@ -74,7 +72,11 @@ from pymc.distributions.shape_utils import (
+     rv_size_is_none,
+     to_tuple,
+ )
+-from pymc.distributions.transforms import Interval, ZeroSumTransform, _default_transform
++from pymc.distributions.transforms import (
++    CholeskyCorrTransform,
++    ZeroSumTransform,
++    _default_transform,
++)
+ from pymc.logprob.abstract import _logprob
+ from pymc.logprob.rewriting import (
+     specialization_ir_rewrites_db,
+@@ -897,50 +899,10 @@ class OrderedMultinomial:
+         return _OrderedMultinomial.dist(*args, **kwargs)
+ 
+ 
+-def posdef(AA):
+-    try:
+-        scipy.linalg.cholesky(AA)
+-        return True
+-    except scipy.linalg.LinAlgError:
+-        return False
+-
+-
+-class PosDefMatrix(Op):
+-    """Check if input is positive definite. Input should be a square matrix."""
+-
+-    # Properties attribute
+-    __props__ = ()
+-
+-    # Compulsory if itypes and otypes are not defined
+-
+-    def make_node(self, x):
+-        x = pt.as_tensor_variable(x)
+-        assert x.ndim == 2
+-        o = TensorType(dtype="bool", shape=[])()
+-        return Apply(self, [x], [o])
+-
+-    # Python implementation:
+-    def perform(self, node, inputs, outputs):
+-        (x,) = inputs
+-        (z,) = outputs
+-        try:
+-            z[0] = np.array(posdef(x), dtype="bool")
+-        except Exception:
+-            pm._log.exception("Failed to check if %s positive definite", x)
+-            raise
+-
+-    def infer_shape(self, fgraph, node, shapes):
+-        return [[]]
+-
+-    def grad(self, inp, grads):
+-        (x,) = inp
+-        return [x.zeros_like(pytensor.config.floatX)]
+-
+-    def __str__(self):
+-        return "MatrixIsPositiveDefinite"
+-
+-
+-matrix_pos_def = PosDefMatrix()
++def matrix_pos_def(X, tol=1e-8):
++    L = pt.linalg.cholesky(X)
++    diag = pt.diagonal(L, axis1=-2, axis2=-1)
++    return pt.all(~pt.isnan(diag)) & pt.all(diag > tol)
+ 
+ 
+ class WishartRV(RandomVariable):
+@@ -1140,31 +1102,30 @@ def WishartBartlett(name, S, nu, is_cholesky=False, return_cholesky=False, initv
+ 
+ 
+ def _lkj_normalizing_constant(eta, n):
+-    # TODO: This is mixing python branching with the potentially symbolic n and eta variables
+-    if not isinstance(eta, int | float):
+-        raise NotImplementedError("eta must be an int or float")
+-    if not isinstance(n, int):
+-        raise NotImplementedError("n must be an integer")
+-    if eta == 1:
+-        result = gammaln(2.0 * pt.arange(1, int((n - 1) / 2) + 1)).sum()
+-        if n % 2 == 1:
+-            result += (
++    result_1 = gammaln(2.0 * pt.arange(1, ((n - 1) / 2) + 1)).sum()
++    result_2 = -(n - 1) * gammaln(eta + 0.5 * (n - 1))
++    k = pt.arange(1, n)
++
++    return pt.switch(
++        pt.eq(eta, 1.0),
++        pt.switch(
++            pt.eq(n % 2, 1.0),
++            result_1
++            + (
+                 0.25 * (n**2 - 1) * pt.log(np.pi)
+                 - 0.25 * (n - 1) ** 2 * pt.log(2.0)
+-                - (n - 1) * gammaln(int((n + 1) / 2))
+-            )
+-        else:
+-            result += (
++                - (n - 1) * gammaln((n + 1) / 2)
++            ),
++            result_1
++            + (
+                 0.25 * n * (n - 2) * pt.log(np.pi)
+                 + 0.25 * (3 * n**2 - 4 * n) * pt.log(2.0)
+                 + n * gammaln(n / 2)
+                 - (n - 1) * gammaln(n)
+-            )
+-    else:
+-        result = -(n - 1) * gammaln(eta + 0.5 * (n - 1))
+-        k = pt.arange(1, n)
+-        result += (0.5 * k * pt.log(np.pi) + gammaln(eta + 0.5 * (n - 1 - k))).sum()
+-    return result
++            ),
++        ),
++        result_2 + (0.5 * k * pt.log(np.pi) + gammaln(eta + 0.5 * (n - 1 - k))).sum(),
++    )
+ 
+ 
+ # _LKJCholeskyCovBaseRV requires a properly shaped `D`, which means the variable can't
+@@ -1174,11 +1135,11 @@ class _LKJCholeskyCovRV(SymbolicRandomVariable):
+     _print_name = ("_lkjcholeskycov", "\\operatorname{_lkjcholeskycov}")
+ 
+     @classmethod
+-    def rv_op(cls, n, eta, sd_dist, *, size=None):
++    def rv_op(cls, n, eta, sd_dist, *, size=None, rng=None):
+         # We don't allow passing `rng` because we don't fully control the rng of the components!
+         n = pt.as_tensor(n, dtype="int64", ndim=0)
+         eta = pt.as_tensor_variable(eta, ndim=0)
+-        rng = pytensor.shared(np.random.default_rng())
++        rng = normalize_rng_param(rng)
+         size = normalize_size_param(size)
+ 
+         # We resize the sd_dist automatically so that it has (size x n) independent
+@@ -1202,15 +1163,11 @@ class _LKJCholeskyCovRV(SymbolicRandomVariable):
+         D = sd_dist.type(name="D")  # Make sd_dist opaque to OpFromGraph
+         size = D.shape[:-1]
+ 
+-        # We flatten the size to make operations easier, and then rebuild it
+-        flat_size = pt.prod(size, dtype="int64")
+-
+-        next_rng, C = LKJCorrRV._random_corr_matrix(rng=rng, n=n, eta=eta, flat_size=flat_size)
+-        D_matrix = D.reshape((flat_size, n))
+-        C *= D_matrix[..., :, None] * D_matrix[..., None, :]
++        final_rng, C = LKJCorrRV._random_corr_matrix(n=n, eta=eta, size=size, rng=rng)
++        C = D[..., :, None] * C
+ 
+         tril_idx = pt.tril_indices(n, k=0)
+-        samples = pt.linalg.cholesky(C)[..., tril_idx[0], tril_idx[1]]
++        samples = C[..., tril_idx[0], tril_idx[1]]
+ 
+         if rv_size_is_none(size):
+             samples = samples[0]
+@@ -1220,7 +1177,7 @@ class _LKJCholeskyCovRV(SymbolicRandomVariable):
+ 
+         return _LKJCholeskyCovRV(
+             inputs=[rng, n, eta, D],
+-            outputs=[next_rng, samples],
++            outputs=[final_rng, samples],
+         )(rng, n, eta, sd_dist)
+ 
+     def update(self, node):
+@@ -1252,7 +1209,7 @@ class _LKJCholeskyCov(Distribution):
+ 
+ @_change_dist_size.register(_LKJCholeskyCovRV)
+ def change_LKJCholeksyCovRV_size(op, dist, new_size, expand=False):
+-    n, eta, sd_dist = dist.owner.inputs[1:]
++    _, n, eta, sd_dist = dist.owner.inputs
+ 
+     if expand:
+         old_size = sd_dist.shape[:-1]
+@@ -1493,7 +1450,7 @@ class LKJCholeskyCov:
+ 
+ class LKJCorrRV(SymbolicRandomVariable):
+     name = "lkjcorr"
+-    extended_signature = "[rng],[size],(),()->[rng],(n)"
++    extended_signature = "[rng],[size],(),()->[rng],(n,n)"
+     _print_name = ("LKJCorrRV", "\\operatorname{LKJCorrRV}")
+ 
+     def make_node(self, rng, size, n, eta):
+@@ -1507,142 +1464,72 @@ class LKJCorrRV(SymbolicRandomVariable):
+ 
+         return super().make_node(rng, size, n, eta)
+ 
++    def update(self, node):
++        return {node.inputs[0]: node.outputs[0]}
++
+     @classmethod
+-    def rv_op(cls, n: int, eta, *, rng=None, size=None):
+-        # We flatten the size to make operations easier, and then rebuild it
++    def rv_op(cls, n: int, eta, *, size=None, rng=None):
+         n = pt.as_tensor(n, ndim=0, dtype=int)
+         eta = pt.as_tensor(eta, ndim=0)
+         rng = normalize_rng_param(rng)
+-        size = normalize_size_param(size)
+ 
+-        if rv_size_is_none(size):
+-            flat_size = 1
+-        else:
+-            flat_size = pt.prod(size, dtype="int64")
+-
+-        next_rng, C = cls._random_corr_matrix(rng=rng, n=n, eta=eta, flat_size=flat_size)
+-
+-        triu_idx = pt.triu_indices(n, k=1)
+-        samples = C[..., triu_idx[0], triu_idx[1]]
+-
+-        if rv_size_is_none(size):
+-            samples = samples[0]
+-        else:
+-            dist_shape = (n * (n - 1)) // 2
+-            samples = pt.reshape(samples, (*size, dist_shape))
+-
+-        return cls(
+-            inputs=[rng, size, n, eta],
+-            outputs=[next_rng, samples],
+-        )(rng, size, n, eta)
++        size = normalize_size_param(size)
++        final_rng, C = cls._random_corr_matrix(rng=rng, n=n, eta=eta, size=size)
+ 
+-        return samples
++        return cls(inputs=[rng, size, n, eta], outputs=[final_rng, C])(rng, size, n, eta)
+ 
+     @classmethod
+     def _random_corr_matrix(
+-        cls, rng: Variable, n: int, eta: TensorVariable, flat_size: TensorVariable
++        cls, n: int, eta: TensorVariable, size: TensorVariable, rng
+     ) -> tuple[Variable, TensorVariable]:
+-        # original implementation in R see:
+-        # https://github.com/rmcelreath/rethinking/blob/master/R/distributions.r
+-
+-        beta = eta - 1.0 + n / 2.0
+-        next_rng, beta_rvs = pt.random.beta(
+-            alpha=beta, beta=beta, size=flat_size, rng=rng
+-        ).owner.outputs
+-        r12 = 2.0 * beta_rvs - 1.0
+-        P = pt.full((flat_size, n, n), pt.eye(n))
+-        P = P[..., 0, 1].set(r12)
+-        P = P[..., 1, 1].set(pt.sqrt(1.0 - r12**2))
+-        n = get_underlying_scalar_constant_value(n)
+-        for mp1 in range(2, n):
+-            beta -= 0.5
+-            next_rng, y = pt.random.beta(
+-                alpha=mp1 / 2.0, beta=beta, size=flat_size, rng=next_rng
+-            ).owner.outputs
+-            next_rng, z = pt.random.normal(
+-                loc=0, scale=1, size=(flat_size, mp1), rng=next_rng
+-            ).owner.outputs
+-            z = z / pt.sqrt(pt.einsum("ij,ij->i", z, z.copy()))[..., np.newaxis]
+-            P = P[..., 0:mp1, mp1].set(pt.sqrt(y[..., np.newaxis]) * z)
+-            P = P[..., mp1, mp1].set(pt.sqrt(1.0 - y))
+-        C = pt.einsum("...ji,...jk->...ik", P, P.copy())
+-        return next_rng, C
+-
+-
+-class MultivariateIntervalTransform(Interval):
+-    name = "interval"
++        size = () if rv_size_is_none(size) else size
+ 
+-    def log_jac_det(self, *args):
+-        return super().log_jac_det(*args).sum(-1)
++        beta0 = eta - 1.0 + n / 2.0
+ 
++        next_rng, y0 = pt.random.beta(alpha=beta0, beta=beta0, size=size, rng=rng).owner.outputs
+ 
+-# Returns list of upper triangular values
+-class _LKJCorr(BoundedContinuous):
+-    rv_type = LKJCorrRV
+-    rv_op = LKJCorrRV.rv_op
+-
+-    @classmethod
+-    def dist(cls, n, eta, **kwargs):
+-        n = pt.as_tensor_variable(n).astype(int)
+-        eta = pt.as_tensor_variable(eta)
+-        return super().dist([n, eta], **kwargs)
++        r12 = 2.0 * y0 - 1.0
+ 
+-    def support_point(rv, *args):
+-        return pt.zeros_like(rv)
++        P0 = pt.full((*size, n, n), pt.eye(n))
++        P0 = P0[..., 0, 1].set(r12)
++        P0 = P0[..., 1, 1].set(pt.sqrt(1.0 - r12**2))
+ 
+-    def logp(value, n, eta):
+-        """
+-        Calculate logp of LKJ distribution at specified value.
++        def step(mp1, beta, P, prev_rng):
++            beta_next = beta - 0.5
+ 
+-        Parameters
+-        ----------
+-        value: numeric
+-            Value for which log-probability is calculated.
++            middle_rng, y = pt.random.beta(
++                alpha=mp1 / 2.0, beta=beta, size=size, rng=prev_rng
++            ).owner.outputs
+ 
+-        Returns
+-        -------
+-        TensorVariable
+-        """
+-        if value.ndim > 1:
+-            raise NotImplementedError("LKJCorr logp is only implemented for vector values (ndim=1)")
++            final_rng, z = pt.random.normal(
++                loc=0, scale=1, size=(*size, mp1), rng=middle_rng
++            ).owner.outputs
+ 
+-        # TODO: PyTensor does not have a `triu_indices`, so we can only work with constant
+-        #  n (or else find a different expression)
+-        try:
+-            n = int(get_underlying_scalar_constant_value(n))
+-        except NotScalarConstantError:
+-            raise NotImplementedError("logp only implemented for constant `n`")
++            ein_sig_z = "i, i->" if z.ndim == 1 else "...ij, ...ij->...i"
+ 
+-        shape = n * (n - 1) // 2
+-        tri_index = np.zeros((n, n), dtype="int32")
+-        tri_index[np.triu_indices(n, k=1)] = np.arange(shape)
+-        tri_index[np.triu_indices(n, k=1)[::-1]] = np.arange(shape)
++            z = z / pt.sqrt(pt.einsum(ein_sig_z, z, z.copy()))[..., None]
++            P = P[..., 0:mp1, mp1].set(pt.sqrt(y[..., None]) * z)
++            P = P[..., mp1, mp1].set(pt.sqrt(1.0 - y))
+ 
+-        value = pt.take(value, tri_index)
+-        value = pt.fill_diagonal(value, 1)
++            return beta_next, P, final_rng
+ 
+-        # TODO: _lkj_normalizing_constant currently requires `eta` and `n` to be constants
+-        try:
+-            eta = float(get_underlying_scalar_constant_value(eta))
+-        except NotScalarConstantError:
+-            raise NotImplementedError("logp only implemented for constant `eta`")
+-        result = _lkj_normalizing_constant(eta, n)
+-        result += (eta - 1.0) * pt.log(det(value))
+-        return check_parameters(
+-            result,
+-            value >= -1,
+-            value <= 1,
+-            matrix_pos_def(value),
+-            eta > 0,
++        _, P_seq, final_rng = pytensor.scan(
++            fn=step,
++            sequences=[pt.arange(2, n)],
++            outputs_info=[beta0, P0, next_rng],
++            strict=True,
++            return_updates=False,
+         )
+ 
++        # This is the concatenation of P_seq and the initial P0 (scan slices it away by default to be "helpful")
++        # Select the final element along the scan axis (this is the result)
++        P = P_seq.owner.inputs[0][-1]
++        # C = pt.einsum("...ji,...jk->...ik", P, P.copy())
+ 
+-@_default_transform.register(_LKJCorr)
+-def lkjcorr_default_transform(op, rv):
+-    return MultivariateIntervalTransform(-1.0, 1.0)
++        return final_rng, P.mT
+ 
+ 
+-class LKJCorr:
++class LKJCorr(BoundedContinuous):
+     r"""
+     The LKJ (Lewandowski, Kurowicka and Joe) distribution.
+ 
+@@ -1662,10 +1549,6 @@ class LKJCorr:
+         The shape parameter (eta > 0) of the LKJ distribution. eta = 1
+         implies a uniform distribution of the correlation matrices;
+         larger values put more weight on matrices with few correlations.
+-    return_matrix : bool, default=False
+-        If True, returns the full correlation matrix.
+-        False only returns the values of the upper triangular matrix excluding
+-        diagonal in a single vector of length n(n-1)/2 for memory efficiency
+ 
+     Notes
+     -----
+@@ -1680,7 +1563,7 @@ class LKJCorr:
+             # Define the vector of fixed standard deviations
+             sds = 3 * np.ones(10)
+ 
+-            corr = pm.LKJCorr("corr", eta=4, n=10, return_matrix=True)
++            corr = pm.LKJCorr("corr", eta=4, n=10)
+ 
+             # Define a new MvNormal with the given correlation matrix
+             vals = sds * pm.MvNormal("vals", mu=np.zeros(10), cov=corr, shape=10)
+@@ -1690,10 +1573,6 @@ class LKJCorr:
+             chol = pt.linalg.cholesky(corr)
+             vals = sds * pt.dot(chol, vals_raw)
+ 
+-            # The matrix is internally still sampled as a upper triangular vector
+-            # If you want access to it in matrix form in the trace, add
+-            pm.Deterministic("corr_mat", corr)
+-
+ 
+     References
+     ----------
+@@ -1703,26 +1582,57 @@ class LKJCorr:
+         100(9), pp.1989-2001.
+     """
+ 
+-    def __new__(cls, name, n, eta, *, return_matrix=False, **kwargs):
+-        c_vec = _LKJCorr(name, eta=eta, n=n, **kwargs)
+-        if not return_matrix:
+-            return c_vec
+-        else:
+-            return cls.vec_to_corr_mat(c_vec, n)
++    rv_type = LKJCorrRV
++    rv_op = LKJCorrRV.rv_op
+ 
+     @classmethod
+-    def dist(cls, n, eta, *, return_matrix=False, **kwargs):
+-        c_vec = _LKJCorr.dist(eta=eta, n=n, **kwargs)
+-        if not return_matrix:
+-            return c_vec
+-        else:
+-            return cls.vec_to_corr_mat(c_vec, n)
++    def dist(cls, n, eta, **kwargs):
++        n = pt.as_tensor_variable(n).astype(int)
++        eta = pt.as_tensor_variable(eta)
++        return super().dist([n, eta], **kwargs)
+ 
+-    @classmethod
+-    def vec_to_corr_mat(cls, vec, n):
+-        tri = pt.zeros(pt.concatenate([vec.shape[:-1], (n, n)]))
+-        tri = pt.subtensor.set_subtensor(tri[(..., *np.triu_indices(n, 1))], vec)
+-        return tri + pt.moveaxis(tri, -2, -1) + pt.diag(pt.ones(n))
++    @staticmethod
++    def support_point(rv: TensorVariable, *args):
++        return pt.broadcast_to(pt.eye(rv.shape[-1]), rv.shape)
++
++    @staticmethod
++    def logp(value: TensorVariable, n, eta):
++        """
++        Calculate the logp of a correlation matrix under an LKJ distribution.
++
++        Parameters
++        ----------
++        value: numeric
++            Value for which log-probability is calculated.
++
++        Returns
++        -------
++        TensorVariable
++        """
++        # n has to be a constant, otherwise the shape of the RV would not be fixed between draws.
++        try:
++            n = int(get_underlying_scalar_constant_value(n))
++        except NotScalarConstantError:
++            raise NotImplementedError("logp only implemented for constant `n`")
++
++        result = _lkj_normalizing_constant(eta, n) + (eta - 1.0) * 2 * pt.diagonal(
++            value, axis1=-2, axis2=-1
++        ).log().sum(axis=-1)
++
++        row_norms = pt.sum(value**2, axis=-1)
++
++        return check_parameters(
++            result,
++            eta > 0,
++            pt.isclose(row_norms, 1.0),
++            msg="Invalid values passed to LKJCorr logp: value is not a valid correlationm matrix or eta <= 0.",
++        )
++
++
++@_default_transform.register(LKJCorr)
++def lkjcorr_default_transform(op, rv):
++    rng, shape, n, eta, *_ = rv.owner.inputs
++    return CholeskyCorrTransform(n=n, upper=False)
+ 
+ 
+ class MatrixNormalRV(RandomVariable):
+diff --git a/pymc/distributions/transforms.py b/pymc/distributions/transforms.py
+index c56cba8a5..aaf5aad47 100644
+--- a/pymc/distributions/transforms.py
++++ b/pymc/distributions/transforms.py
+@@ -19,7 +19,7 @@ import pytensor.tensor as pt
+ 
+ from numpy.lib.array_utils import normalize_axis_tuple
+ from pytensor.graph import Op
+-from pytensor.tensor import TensorVariable
++from pytensor.tensor import TensorLike, TensorVariable
+ 
+ from pymc.logprob.transforms import (
+     ChainedTransform,
+@@ -33,10 +33,15 @@ from pymc.logprob.transforms import (
+ 
+ __all__ = [
+     "Chain",
++    "Chain",
++    "CholeskyCorrTransform",
++    "CholeskyCovPacked",
+     "CholeskyCovPacked",
+     "Interval",
+     "Transform",
+     "ZeroSumTransform",
++    "ZeroSumTransform",
++    "circular",
+     "circular",
+     "log",
+     "log_exp_m1",
+@@ -135,6 +140,290 @@ class SumTo1(Transform):
+         return pt.sum(y, axis=-1)
+ 
+ 
++class CholeskyCorrTransform(Transform):
++    """
++    Map an unconstrained real vector the Cholesky factor of a correlation matrix.
++
++    For detailed description of the transform, [1]_ and [2]_.
++
++    This is typically used with :class:`~pymc.distributions.LKJCholeskyCov` to place priors on correlation structures.
++    For a related transform that additionally rescales diagonal elements (working on covariance factors), see
++    :class:`~pymc.distributions.transforms.CholeskyCovPacked`.
++
++    Adapted from the implementation in TensorFlow Probability [3]_:
++    https://github.com/tensorflow/probability/blob/94f592af363e13391858b48f785eb4c250912904/tensorflow_probability/python/bijectors/correlation_cholesky.py#L31
++
++    Examples
++    --------
++
++    .. code-block:: python
++
++        import numpy as np
++        import pytensor.tensor as pt
++        from pymc.distributions.transforms import CholeskyCorr
++
++        unconstrained_vector = pt.as_tensor(np.array([2.0, 2.0, 1.0]))
++        n = unconstrained_vector.shape[0]
++        tr = CholeskyCorr(n)
++        constrained_matrix = tr.forward(unconstrained_vector)
++        y.eval()
++        array(
++            [[1.0, 0.0, 0.0], [0.70710678, 0.70710678, 0.0], [0.66666667, 0.66666667, 0.33333333]]
++        )
++
++    References
++    ----------
++    .. [1] Lewandowski, D., Kurowicka, D., & Joe, H. (2009).
++       Generating random correlation matrices based on vines and extended onion method.
++       Journal of Multivariate Analysis, 100(9), 1989–2001.
++    .. [2] Stan Development Team. Stan Functions Reference. Section on LKJ / Cholesky correlation.
++    .. [3] TensorFlow Probability. Correlation Cholesky bijector implementation.
++       https://github.com/tensorflow/probability/
++    """
++
++    name = "cholesky_corr"
++
++    def __init__(self, n, upper: bool = False):
++        """
++        Initialize the CholeskyCorr transform.
++
++        Parameters
++        ----------
++        n : int
++            Size of the correlation matrix.
++        upper: bool, default False
++            If True, transform to an upper triangular matrix. If False, transform to a lower triangular matrix.
++        """
++        self.n = n
++        self.m = (n * (n + 1)) // 2  # Number of triangular elements
++        self.upper = upper
++
++        super().__init__()
++
++    def _fill_triangular_spiral(
++        self, x_raveled: TensorLike, unit_diag: bool = True
++    ) -> TensorVariable:
++        """
++        Create a triangular matrix from a vector by filling it in a spiral order.
++
++        This code is adapted from the `fill_triangular` function in TensorFlow Probability:
++        https://github.com/tensorflow/probability/blob/a26f4cbe5ce1549767e13798d9bf5032dac4257b/tensorflow_probability/python/math/linalg.py#L925
++
++        Parameters
++        ----------
++        x_raveled: TensorLike
++            The input vector to be reshaped into a triangular matrix.
++        unit_diag: bool, default False
++            If True, the diagonal elements are assumed to be 1 and are not filled from the input vector. The input
++            vector is expected to have length m = n * (n - 1) / 2 in this case, containing only the off-diagonal
++            elements.
++
++        Returns
++        -------
++        triangular_matrix: TensorVariable
++            The resulting triangular matrix.
++
++        Notes
++        -----
++        By "spiral order", it is meant that the matrix is filled by jumping between the top and bottom rows, flipping
++        the fill order from left-to-right to right-to-left on each jump. For example, to fill a 4x4 matrix with
++        `order=True`, the matrix is filled in the following order:
++
++        - Row 0, left to right
++        - Row 3, right to left
++        - Row 1, left to right
++        - Row 2, right to left
++
++        When `upper` if False, everything is reversed:
++
++        - Row 3, right to left
++        - Row 0, left to right
++        - Row 2, right to left
++        - Row 1, left to right
++
++        After filling, entries not part of the triangular matrix are set to zero.
++
++        Examples
++        --------
++
++        .. code-block:: python
++
++            import numpy as np
++            from pymc.distributions.transforms import CholeskyCorr
++
++            tr = CholeskyCorr(n=4)
++            x_unconstrained = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
++            tr._fill_triangular_spiral(x_unconstrained, upper=False).eval()
++
++            # Out:
++            # array([[ 5,  0,  0,  0],
++            #        [ 9, 10,  0,  0],
++            #        [ 8,  7,  6,  0],
++            #        [ 4,  3,  2,  1]])
++        """
++        x_raveled = pt.as_tensor(x_raveled)
++        *batch_shape, _ = x_raveled.shape
++        n, m = self.n, self.m
++        upper = self.upper
++
++        if unit_diag:
++            n = n - 1
++
++        tail = x_raveled[..., n:]
++
++        if upper:
++            xc = pt.concatenate([x_raveled, pt.flip(tail, -1)], axis=-1)
++        else:
++            xc = pt.concatenate([tail, pt.flip(x_raveled, -1)], axis=-1)
++
++        y = pt.reshape(xc, (*batch_shape, n, n))
++        return pt.triu(y) if upper else pt.tril(y)
++
++    def _inverse_fill_triangular_spiral(
++        self, x: TensorLike, unit_diag: bool = True
++    ) -> TensorVariable:
++        """
++        Inverse operation of `_fill_triangular_spiral`.
++
++        Extracts the elements of a triangular matrix in spiral order and returns them as a vector. For details about
++        what is meant by "spiral order", see the docstring of `_fill_triangular_spiral`.
++
++        Parameters
++        ----------
++        x: TensorVariable
++            The input triangular matrix.
++        unit_diag: bool
++            If True, the diagonal elements are assumed to be 1 and are not included in the output vector.
++
++        Returns
++        -------
++        x_raveled: TensorVariable
++            The resulting vector containing the elements of the triangular matrix in spiral order.
++        """
++        x = pt.as_tensor(x)
++        *batch_shape, _, _ = x.shape
++        n, m = self.n, self.m
++
++        if unit_diag:
++            m = m - n
++            n = n - 1
++
++        upper = self.upper
++
++        if upper:
++            initial_elements = x[..., 0, :]
++            triangular_portion = x[..., 1:, :]
++        else:
++            initial_elements = pt.flip(x[..., -1, :], axis=-1)
++            triangular_portion = x[..., :-1, :]
++
++        rotated_triangular_portion = pt.flip(triangular_portion, axis=(-1, -2))  # type: ignore[arg-type]
++        consolidated_matrix = triangular_portion + rotated_triangular_portion
++        end_sequence = pt.reshape(
++            consolidated_matrix,
++            (*batch_shape, pt.cast(n * (n - 1), "int64")),
++        )
++        y = pt.concatenate([initial_elements, end_sequence[..., : m - n]], axis=-1)
++
++        return y
++
++    def forward(self, chol_corr_matrix: TensorLike, *inputs):
++        """
++        Transform the Cholesky factor of a correlation matrix into a real-valued vector.
++
++        Parameters
++        ----------
++        chol_corr_matrix : TensorVariable
++            Cholesky factor of a correlation matrix R = L @ L.T of shape (n,n).
++        inputs:
++            Additional input values. Not used; included for signature compatibility with other transformations.
++
++        Returns
++        -------
++        unconstrained_vector: TensorVariable
++            Real-valued vector of length m = n * (n - 1) / 2.
++        """
++        chol_corr_matrix = pt.as_tensor(chol_corr_matrix)
++        n = self.n
++
++        # Extract the reciprocal of the row norms from the diagonal.
++        diag = pt.diagonal(chol_corr_matrix, axis1=-2, axis2=-1)[..., None]
++
++        # Set the diagonal to 0s.
++        diag_idx = pt.arange(n)
++        chol_corr_matrix = chol_corr_matrix[..., diag_idx, diag_idx].set(0)
++
++        # Multiply with the norm (or divide by its reciprocal) to recover the
++        # unconstrained reals in the (strictly) lower triangular part.
++        unconstrained_matrix = chol_corr_matrix / diag
++
++        # Remove the first row and last column before inverting the fill_triangular_spiral
++        # transformation.
++        return self._inverse_fill_triangular_spiral(
++            unconstrained_matrix[..., 1:, :-1], unit_diag=True
++        )
++
++    def backward(self, unconstrained_vector: TensorLike, *inputs):
++        """
++        Transform a real-valued vector of length m = n * (n - 1) / 2 into the Cholesky factor of a correlation matrix.
++
++        Parameters
++        ----------
++        unconstrained_vector : TensorLike
++            Real-valued vector of length m = n * (n - 1) / 2.
++        inputs:
++            Additional input values. Not used; included for signature compatibility with other transformations.
++
++        Returns
++        -------
++        unconstrained_vector: TensorVariable
++            Unconstrained real numbers.
++        """
++        unconstrained_vector = pt.as_tensor(unconstrained_vector)
++        chol_corr_matrix = self._fill_triangular_spiral(unconstrained_vector, unit_diag=True)
++
++        # Pad zeros on the top row and right column.
++        ndim = chol_corr_matrix.ndim
++        paddings = [*([(0, 0)] * (ndim - 2)), [1, 0], [0, 1]]
++        chol_corr_matrix = pt.pad(chol_corr_matrix, paddings)
++
++        diag_idx = pt.arange(self.n)
++        chol_corr_matrix = chol_corr_matrix[..., diag_idx, diag_idx].set(1)
++
++        # Normalize each row to have Euclidean (L2) norm 1.
++        chol_corr_matrix /= pt.linalg.norm(chol_corr_matrix, axis=-1, ord=2)[..., None]
++
++        return chol_corr_matrix
++
++    def log_jac_det(self, unconstrained_vector: TensorLike, *inputs) -> TensorVariable:
++        """
++        Compute the log determinant of the Jacobian.
++
++        Parameters
++        ----------
++        unconstrained_vector : TensorLike
++            Real-valued vector of length m = n * (n - 1) / 2.
++        inputs:
++            Additional input values. Not used; included for signature compatibility with other transformations.
++
++        Returns
++        -------
++        log_jac_det: TensorVariable
++            Log determinant of the Jacobian of the transformation.
++        """
++        unconstrained_vector = pt.as_tensor(unconstrained_vector)
++        chol_corr_matrix = self.backward(unconstrained_vector, *inputs)
++        n = self.n
++        input_dtype = unconstrained_vector.dtype
++
++        # TODO: tfp has a negative sign here; verify if it is needed
++        return pt.sum(
++            pt.arange(2, 2 + n, dtype=input_dtype)
++            * pt.log(pt.diagonal(chol_corr_matrix, axis1=-2, axis2=-1)),
++            axis=-1,
++        )
++
++
+ class CholeskyCovPacked(Transform):
+     """Transforms the diagonal elements of the LKJCholeskyCov distribution to be on the log scale."""
+ 
+diff --git a/pymc/sampling/jax.py b/pymc/sampling/jax.py
+index 7a8908585..97620cf1a 100644
+--- a/pymc/sampling/jax.py
++++ b/pymc/sampling/jax.py
+@@ -45,7 +45,6 @@ from pymc.backends.arviz import (
+     find_constants,
+     find_observations,
+ )
+-from pymc.distributions.multivariate import PosDefMatrix
+ from pymc.initial_point import StartDict
+ from pymc.logprob.utils import CheckParameterValue
+ from pymc.sampling.mcmc import _init_jitter
+@@ -84,15 +83,6 @@ def jax_funcify_Assert(op, **kwargs):
+     return assert_fn
+ 
+ 
+-@jax_funcify.register(PosDefMatrix)
+-def jax_funcify_PosDefMatrix(op, **kwargs):
+-    def posdefmatrix_fn(value, *inps):
+-        no_pos_def = jnp.any(jnp.isnan(jnp.linalg.cholesky(value)))
+-        return jnp.invert(no_pos_def)
+-
+-    return posdefmatrix_fn
+-
+-
+ def _replace_shared_variables(graph: list[TensorVariable]) -> list[TensorVariable]:
+     """Replace shared variables in graph by their constant values.
+ 
+diff --git a/pymc/testing.py b/pymc/testing.py
+index 5d591ae02..40e816b13 100644
+--- a/pymc/testing.py
++++ b/pymc/testing.py
+@@ -907,6 +907,56 @@ def continuous_random_tester(
+         assert p > alpha, str(point)
+ 
+ 
++def partially_deterministic_continuous_random_tester(
++    dist,
++    paramdomains,
++    valuedomain=None,
++    ref_rand=None,
++    size=10000,
++    alpha=0.05,
++    fails=10,
++    extra_args=None,
++    model_args=None,
++):
++    if valuedomain is None:
++        valuedomain = Domain([0], edges=(None, None))
++
++    if model_args is None:
++        model_args = {}
++
++    model, param_vars = build_model(dist, valuedomain, paramdomains, extra_args)
++    model_dist = change_dist_size(model.named_vars["value"], size, expand=True)
++    pymc_rand = compile([], model_dist)
++
++    domains = paramdomains.copy()
++    for point in product(domains, n_samples=100):
++        point = pm.Point(point, model=model)
++        point.update(model_args)
++
++        # Update the shared parameter variables in `param_vars`
++        for k, v in point.items():
++            nv = param_vars.get(k, model.named_vars.get(k))
++            if nv.name in param_vars:
++                param_vars[nv.name].set_value(v)
++
++        p = alpha
++        # Allow KS test to fail (i.e., the samples be different)
++        # a certain number of times. Crude, but necessary.
++        f = fails
++        while p <= alpha and f > 0:
++            s0 = pymc_rand()
++            s1 = floatX(ref_rand(size=size, **point))
++
++            # If a distribution has non-stochastic elements in the output (e.g. LKJCorr putting 1's on the diagonal),
++            # it will mess up the KS test. So we filter those out here.
++            stacked_samples = np.c_[np.atleast_1d(s0).flatten(), np.atleast_1d(s1).flatten()]
++            samples = stacked_samples[~np.isclose(stacked_samples[..., 0], stacked_samples[..., 1])]
++
++            _, p = st.ks_2samp(*samples.T)
++            f -= 1
++        assert p > alpha, str(point)
++
++
+ def discrete_random_tester(
+     dist,
+     paramdomains,
