@@ -1,0 +1,1151 @@
+diff --git a/src/sqlfluff/core/parser/parsers.py b/src/sqlfluff/core/parser/parsers.py
+index e6ff19e7f..285eee861 100644
+--- a/src/sqlfluff/core/parser/parsers.py
++++ b/src/sqlfluff/core/parser/parsers.py
+@@ -285,17 +285,13 @@ class RegexParser(BaseParser):
+         anti_template: Optional[str] = None,
+         trim_chars: Optional[tuple[str, ...]] = None,
+         casefold: Optional[Callable[[str], str]] = None,
+-        ignore_case: bool = True,
+     ):
+         # Store the optional anti-template
+         self.template = template
+         self.anti_template = anti_template
+-        self.ignore_case = ignore_case
+         # Compile regexes upfront to avoid repeated overhead
+-        self._anti_template = regex.compile(
+-            anti_template or r"", regex.IGNORECASE if ignore_case else 0
+-        )
+-        self._template = regex.compile(template, regex.IGNORECASE if ignore_case else 0)
++        self._anti_template = regex.compile(anti_template or r"", regex.IGNORECASE)
++        self._template = regex.compile(template, regex.IGNORECASE)
+         super().__init__(
+             raw_class=raw_class,
+             type=type,
+@@ -324,9 +320,10 @@ class RegexParser(BaseParser):
+     ) -> MatchResult:
+         """Match against this matcher.
+ 
+-        NOTE: This method's case sensitivity is based on objects ignore_case property
++        NOTE: This method uses .raw_upper and so case sensitivity is
++        not supported.
+         """
+-        _raw = segments[idx].raw_upper if self.ignore_case else segments[idx].raw
++        _raw = segments[idx].raw_upper
+         result = self._template.match(_raw)
+         if result:
+             result_string = result.group(0)
+diff --git a/src/sqlfluff/dialects/dialect_tsql.py b/src/sqlfluff/dialects/dialect_tsql.py
+index 2f041bce3..780eaafb4 100644
+--- a/src/sqlfluff/dialects/dialect_tsql.py
++++ b/src/sqlfluff/dialects/dialect_tsql.py
+@@ -42,7 +42,6 @@ from sqlfluff.core.parser import (
+ )
+ from sqlfluff.dialects import dialect_ansi as ansi
+ from sqlfluff.dialects.dialect_tsql_keywords import (
+-    DATATYPE_METHODS,
+     FUTURE_RESERVED_KEYWORDS,
+     RESERVED_KEYWORDS,
+     UNRESERVED_KEYWORDS,
+@@ -60,11 +59,9 @@ tsql_dialect = ansi_dialect.copy_as(
+ tsql_dialect.sets("reserved_keywords").clear()
+ tsql_dialect.sets("unreserved_keywords").clear()
+ tsql_dialect.sets("future_reserved_keywords").clear()
+-tsql_dialect.sets("datatype_methods").clear()
+ tsql_dialect.sets("reserved_keywords").update(RESERVED_KEYWORDS)
+ tsql_dialect.sets("unreserved_keywords").update(UNRESERVED_KEYWORDS)
+ tsql_dialect.sets("future_reserved_keywords").update(FUTURE_RESERVED_KEYWORDS)
+-tsql_dialect.sets("datatype_methods").update(DATATYPE_METHODS)
+ 
+ # Set the datetime units
+ tsql_dialect.sets("datetime_units").clear()
+@@ -504,14 +501,6 @@ tsql_dialect.add(
+     ActionParameterSegment=RegexParser(
+         r"\$ACTION", CodeSegment, type="action_parameter"
+     ),
+-    DatatypeMethodNameIdentifierSegment=SegmentGenerator(
+-        lambda dialect: RegexParser(
+-            r"^(" + r"|".join(sorted(dialect.sets("datatype_methods"))) + r")$",
+-            CodeSegment,
+-            type="datatype_method_name_identifier",
+-            ignore_case=False,
+-        )
+-    ),
+ )
+ 
+ tsql_dialect.replace(
+@@ -862,9 +851,6 @@ class StatementSegment(ansi.StatementSegment):
+             Ref("CreateSynonymStatementSegment"),
+             Ref("DropSynonymStatementSegment"),
+             Ref("CreateServerRoleStatementSegment"),
+-            Ref("CreateXmlSchemaCollectionStatementSegment"),
+-            Ref("AlterXmlSchemaCollectionStatementSegment"),
+-            Ref("DropXmlSchemaCollectionStatementSegment"),
+             # DML Data Manipulation Language
+             # https://learn.microsoft.com/en-us/sql/t-sql/queries/queries
+             Ref("BulkInsertStatementSegment"),
+@@ -1554,33 +1540,6 @@ class LessThanOrEqualToSegment(CompositeComparisonOperatorSegment):
+     )
+ 
+ 
+-class FunctionNameSegment(BaseSegment):
+-    """Function name, including any prefix bits, e.g. project or schema.
+-
+-    Override in TSQL to exclude DatatypeMethodNameIdentifierSegment
+-    """
+-
+-    type = "function_name"
+-    match_grammar: Matchable = Sequence(
+-        # Project name, schema identifier, etc.
+-        AnyNumberOf(
+-            Sequence(
+-                Ref("SingleIdentifierGrammar"),
+-                Ref("DotSegment"),
+-            ),
+-            terminators=[Ref("BracketedSegment")],
+-        ),
+-        # Base function name
+-        OneOf(
+-            Ref("FunctionNameIdentifierSegment"),
+-            Ref("QuotedIdentifierSegment"),
+-            exclude=Ref("DatatypeMethodNameIdentifierSegment"),
+-            terminators=[Ref("BracketedSegment")],
+-        ),
+-        allow_gaps=False,
+-    )
+-
+-
+ class NotEqualToSegment(CompositeComparisonOperatorSegment):
+     """Not equal to operator.
+ 
+@@ -3236,20 +3195,18 @@ class ObjectReferenceSegment(ansi.ObjectReferenceSegment):
+ 
+     Update ObjectReferenceSegment to only allow dot separated SingleIdentifierGrammar
+     So Square Bracketed identifiers can be matched.
+-    And add support for datatype methods
+     """
+ 
+     # match grammar (allow whitespace)
+     match_grammar: Matchable = Sequence(
+         Ref("SingleIdentifierGrammar"),
+         AnyNumberOf(
+-            OneOf(
+-                Ref("DatatypeMethodSegment"),
+-                Sequence(
+-                    Ref("DotSegment"),
+-                    Ref("SingleIdentifierGrammar", optional=True),
+-                ),
++            Sequence(
++                Ref("DotSegment"),
++                Ref("SingleIdentifierGrammar", optional=True),
+             ),
++            min_times=0,
++            max_times=3,
+         ),
+     )
+ 
+@@ -3574,14 +3531,7 @@ class DatatypeSegment(BaseSegment):
+             "TIMESTAMP",
+             "ROWVERSION",
+             "UNIQUEIDENTIFIER",
+-            Sequence(
+-                "XML",
+-                Bracketed(
+-                    OneOf("DOCUMENT", "CONTENT", optional=True),
+-                    Ref("ObjectReferenceSegment"),
+-                    optional=True,
+-                ),
+-            ),
++            "XML",
+             "JSON",
+             # Spatial types
+             "GEOGRAPHY",
+@@ -4812,18 +4762,6 @@ class RankFunctionContentsSegment(BaseSegment):
+     )
+ 
+ 
+-class DatatypeMethodSegment(BaseSegment):
+-    """Datatype Method segment."""
+-
+-    type = "datatype_method"
+-
+-    match_grammar: Matchable = Sequence(
+-        Ref("DotSegment"),
+-        Ref("DatatypeMethodNameIdentifierSegment"),
+-        Ref("FunctionContentsSegment"),
+-    )
+-
+-
+ class FunctionSegment(BaseSegment):
+     """A scalar or aggregate function.
+ 
+@@ -8279,58 +8217,6 @@ class CreateServerRoleStatementSegment(ansi.CreateRoleStatementSegment):
+     )
+ 
+ 
+-class CreateXmlSchemaCollectionStatementSegment(BaseSegment):
+-    """A `CREATE XML SCHEMA COLLECTION` statement.
+-
+-    https://learn.microsoft.com/en-us/sql/t-sql/statements/create-xml-schema-collection-transact-sql?view=sql-server-ver17
+-    """
+-
+-    type = "create_xml_schema_collection_statement"
+-    match_grammar = Sequence(
+-        "CREATE",
+-        "XML",
+-        "SCHEMA",
+-        "COLLECTION",
+-        Ref("ObjectReferenceSegment"),
+-        "AS",
+-        Ref("ExpressionSegment"),
+-    )
+-
+-
+-class AlterXmlSchemaCollectionStatementSegment(BaseSegment):
+-    """A `ALTER XML SCHEMA COLLECTION` statement.
+-
+-    https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-xml-schema-collection-transact-sql
+-    """
+-
+-    type = "alter_xml_schema_collection_statement"
+-    match_grammar = Sequence(
+-        "ALTER",
+-        "XML",
+-        "SCHEMA",
+-        "COLLECTION",
+-        Ref("ObjectReferenceSegment"),
+-        "ADD",
+-        Ref("ExpressionSegment"),
+-    )
+-
+-
+-class DropXmlSchemaCollectionStatementSegment(BaseSegment):
+-    """A `DROP XML SCHEMA COLLECTION` statement.
+-
+-    https://learn.microsoft.com/en-us/sql/t-sql/statements/drop-xml-schema-collection-transact-sql?view=sql-server-ver17
+-    """
+-
+-    type = "drop_xml_schema_collection_statement"
+-    match_grammar = Sequence(
+-        "DROP",
+-        "XML",
+-        "SCHEMA",
+-        "COLLECTION",
+-        Ref("ObjectReferenceSegment"),
+-    )
+-
+-
+ class CreateLoginStatementSegment(BaseSegment):
+     """A `CREATE LOGIN` statement.
+ 
+@@ -9169,13 +9055,7 @@ class ExpressionSegment(BaseSegment):
+     type = "expression"
+ 
+     match_grammar: Matchable = OneOf(
+-        Sequence(
+-            Ref("Expression_A_Grammar"),
+-            AnyNumberOf(
+-                Ref("DatatypeMethodSegment"),
+-            ),
+-        ),
+-        Ref("NextValueSequenceSegment"),
++        Ref("Expression_A_Grammar"), Ref("NextValueSequenceSegment")
+     )
+ 
+ 
+diff --git a/src/sqlfluff/dialects/dialect_tsql_keywords.py b/src/sqlfluff/dialects/dialect_tsql_keywords.py
+index bcde0600f..39b11e326 100644
+--- a/src/sqlfluff/dialects/dialect_tsql_keywords.py
++++ b/src/sqlfluff/dialects/dialect_tsql_keywords.py
+@@ -582,7 +582,6 @@ UNRESERVED_KEYWORDS = [
+     "CONTINUE_AFTER_ERROR",
+     "CONNECTION_OPTIONS",
+     "CONTAINED",
+-    "CONTENT",
+     "COUNT_ROWS",
+     "CONTAINMENT",
+     "CONTEXT_INFO",
+@@ -624,7 +623,6 @@ UNRESERVED_KEYWORDS = [
+     "DISABLED",
+     "DISTRIBUTION",
+     "DISABLE_BROKER",
+-    "DOCUMENT",
+     "DROP_EXISTING",
+     "DROPCLEANBUFFERS",
+     "DURABILITY",
+@@ -1053,85 +1051,3 @@ UNRESERVED_KEYWORDS = [
+     "VECTOR",
+     "VERIFY_CLONEDB",
+ ]
+-
+-# DataType Methods
+-# Unlike normal keywords datatype methods are case sensitive
+-# grouped by datatype and geometry/spatial data classification
+-DATATYPE_METHODS = [
+-    # xml methods
+-    # https://learn.microsoft.com/en-us/sql/t-sql/xml/xml-data-type-methods
+-    "exist",
+-    "modify",
+-    "nodes",
+-    "query",
+-    "value",
+-    # hierarchyid methods
+-    # https://learn.microsoft.com/en-us/sql/t-sql/data-types/hierarchyid-data-type-method-reference
+-    "GetAncestor",
+-    "GetLevel",
+-    "GetReparentedValue",
+-    "GetRoot",
+-    "IsDescendantOf",
+-    "Parse",
+-    "ToString",
+-    # geometry (spatial data) methods
+-    # https://learn.microsoft.com/en-us/sql/t-sql/spatial-geometry/ogc-methods-on-geometry-instances
+-    # Shape properties
+-    "STArea",
+-    "STLength",
+-    "STBoundary",
+-    "STCentroid",
+-    "STEnvelope",
+-    "STConvexHull",
+-    # Geometry representation
+-    "STAsBinary",
+-    "STAsText",
+-    # Geometry type information
+-    "STGeometryType",
+-    "STDimension",
+-    "STSrid",
+-    # Point and curve access
+-    "STStartPoint",
+-    "STEndPoint",
+-    "STPointN",
+-    "STPointOnSurface",
+-    "STCurveN",
+-    "STCurveToLine",
+-    "STX",
+-    "STY",
+-    # Polygon ring access
+-    "STExteriorRing",
+-    "STInteriorRingN",
+-    "STNumInteriorRing",
+-    # Collection access
+-    "STGeometryN",
+-    "STNumGeometries",
+-    "STNumPoints",
+-    "STNumCurves",
+-    # Spatial relationship tests
+-    "STContains",
+-    "STCrosses",
+-    "STDisjoint",
+-    "STEquals",
+-    "STIntersects",
+-    "STOverlaps",
+-    "STRelate",
+-    "STTouches",
+-    "STWithin",
+-    "STDistance",
+-    # Spatial operations
+-    "STBuffer",
+-    "STDifference",
+-    "STIntersection",
+-    "STSymDifference",
+-    "STUnion",
+-    # Validity tests
+-    "STIsClosed",
+-    "STIsEmpty",
+-    "STIsRing",
+-    "STIsSimple",
+-    "STIsValid",
+-    # geography methods share the same ST-prefixed names as geometry methods
+-    # and are already covered by the geometry section above.
+-    # https://learn.microsoft.com/en-us/sql/t-sql/spatial-geography/ogc-methods-on-geography-instances
+-]
+diff --git a/test/fixtures/dialects/tsql/data_types.sql b/test/fixtures/dialects/tsql/data_types.sql
+index 80cc3c1d9..b5f780b23 100644
+--- a/test/fixtures/dialects/tsql/data_types.sql
++++ b/test/fixtures/dialects/tsql/data_types.sql
+@@ -84,13 +84,6 @@ DECLARE @uniqueidentifier_var UNIQUEIDENTIFIER;
+ DECLARE @xml_var XML;
+ DECLARE @json_var JSON;
+ 
+--- typed XML
+-DECLARE @typed_xml XML (SomeSchemaCollection);
+-DECLARE @typed_xml XML (dbo.SomeSchemaCollection);
+-DECLARE @typed_xml XML ([dbo].[SomeSchemaCollection]);
+-DECLARE @typed_xml_document XML (DOCUMENT dbo.SomeSchemaCollection);
+-DECLARE @typed_xml_cnt XML (CONTENT dbo.SomeSchemaCollection);
+-
+ -- Spatial types
+ DECLARE @geography_var GEOGRAPHY;
+ DECLARE @geometry_var GEOMETRY;
+@@ -108,7 +101,6 @@ DECLARE @sys_type sys.sysname;
+ 
+ -- Bracketed data type identifiers
+ DECLARE @bracketed_type [sys].[sysname];
+-DECLARE @bracketed_varchar [varchar](32);
+ GO
+ 
+ -- Data types in CREATE TABLE
+@@ -163,12 +155,7 @@ CREATE TABLE DataTypesTest (
+     col_hierarchyid HIERARCHYID,
+     col_sql_variant SQL_VARIANT,
+     col_timestamp TIMESTAMP,
+-    col_rowversion ROWVERSION,
+-
+-    -- typed XML
+-    col_xml_typed XML (dbo.SomeXMLSchemaCollection),
+-    col_xml_typed_doc XML (DOCUMENT dbo.SomeXMLSchemaCollection),
+-    col_xml_typed_con XML (CONTENT dbo.SomeXMLSchemaCollection)
++    col_rowversion ROWVERSION
+ );
+ GO
+ 
+diff --git a/test/fixtures/dialects/tsql/data_types.yml b/test/fixtures/dialects/tsql/data_types.yml
+index a559d0b8a..c4ed2dbff 100644
+--- a/test/fixtures/dialects/tsql/data_types.yml
++++ b/test/fixtures/dialects/tsql/data_types.yml
+@@ -3,7 +3,7 @@
+ # computed by SQLFluff when running the tests. Please run
+ # `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+ # altering SQL files.
+-_hash: d03e669b6c5f9c91441883c6c321fceb60da3d43050ace0a8ccf0383942164c3
++_hash: a5c0b0194015a606735493aaa6ead91ff50b4fc42cc1704eb59598a0acecca3c
+ file:
+ - batch:
+   - statement:
+@@ -643,76 +643,6 @@ file:
+         data_type:
+           keyword: JSON
+   - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-        keyword: DECLARE
+-        parameter: '@typed_xml'
+-        data_type:
+-          keyword: XML
+-          bracketed:
+-            start_bracket: (
+-            object_reference:
+-              naked_identifier: SomeSchemaCollection
+-            end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-        keyword: DECLARE
+-        parameter: '@typed_xml'
+-        data_type:
+-          keyword: XML
+-          bracketed:
+-            start_bracket: (
+-            object_reference:
+-            - naked_identifier: dbo
+-            - dot: .
+-            - naked_identifier: SomeSchemaCollection
+-            end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-        keyword: DECLARE
+-        parameter: '@typed_xml'
+-        data_type:
+-          keyword: XML
+-          bracketed:
+-            start_bracket: (
+-            object_reference:
+-            - quoted_identifier: '[dbo]'
+-            - dot: .
+-            - quoted_identifier: '[SomeSchemaCollection]'
+-            end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-        keyword: DECLARE
+-        parameter: '@typed_xml_document'
+-        data_type:
+-          keyword: XML
+-          bracketed:
+-            start_bracket: (
+-            keyword: DOCUMENT
+-            object_reference:
+-            - naked_identifier: dbo
+-            - dot: .
+-            - naked_identifier: SomeSchemaCollection
+-            end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-        keyword: DECLARE
+-        parameter: '@typed_xml_cnt'
+-        data_type:
+-          keyword: XML
+-          bracketed:
+-            start_bracket: (
+-            keyword: CONTENT
+-            object_reference:
+-            - naked_identifier: dbo
+-            - dot: .
+-            - naked_identifier: SomeSchemaCollection
+-            end_bracket: )
+-  - statement_terminator: ;
+   - statement:
+       declare_segment:
+         keyword: DECLARE
+@@ -779,19 +709,6 @@ file:
+           dot: .
+           data_type_identifier: '[sysname]'
+   - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-        keyword: DECLARE
+-        parameter: '@bracketed_varchar'
+-        data_type:
+-          data_type_identifier: '[varchar]'
+-          bracketed_arguments:
+-            bracketed:
+-              start_bracket: (
+-              expression:
+-                integer_literal: '32'
+-              end_bracket: )
+-  - statement_terminator: ;
+   - go_statement:
+       keyword: GO
+ - batch:
+@@ -1079,44 +996,6 @@ file:
+             naked_identifier: col_rowversion
+             data_type:
+               keyword: ROWVERSION
+-        - comma: ','
+-        - column_definition:
+-            naked_identifier: col_xml_typed
+-            data_type:
+-              keyword: XML
+-              bracketed:
+-                start_bracket: (
+-                object_reference:
+-                - naked_identifier: dbo
+-                - dot: .
+-                - naked_identifier: SomeXMLSchemaCollection
+-                end_bracket: )
+-        - comma: ','
+-        - column_definition:
+-            naked_identifier: col_xml_typed_doc
+-            data_type:
+-              keyword: XML
+-              bracketed:
+-                start_bracket: (
+-                keyword: DOCUMENT
+-                object_reference:
+-                - naked_identifier: dbo
+-                - dot: .
+-                - naked_identifier: SomeXMLSchemaCollection
+-                end_bracket: )
+-        - comma: ','
+-        - column_definition:
+-            naked_identifier: col_xml_typed_con
+-            data_type:
+-              keyword: XML
+-              bracketed:
+-                start_bracket: (
+-                keyword: CONTENT
+-                object_reference:
+-                - naked_identifier: dbo
+-                - dot: .
+-                - naked_identifier: SomeXMLSchemaCollection
+-                end_bracket: )
+         - end_bracket: )
+     statement_terminator: ;
+     go_statement:
+diff --git a/test/fixtures/dialects/tsql/datatype_methods.sql b/test/fixtures/dialects/tsql/datatype_methods.sql
+deleted file mode 100644
+index c174924c4..000000000
+--- a/test/fixtures/dialects/tsql/datatype_methods.sql
++++ /dev/null
+@@ -1,21 +0,0 @@
+--- Function Case mismatch
+-SELECT SomeSchema.XValue();
+-SELECT SomeSchema.Value();
+-SELECT SomeSchema.VALUE();
+--- Method case case match
+-SELECT SomeColumn.value(), SomeColumn FROM dbo.SomeTable;
+-
+-SELECT @XML.value('.', 'nvarchar(max)') Col1;
+-SELECT CONVERT(xml, N'<r></r>').value('.','nvarchar(max)');
+-SELECT (SELECT CONVERT(xml, N'<r></r>')).value('.','nvarchar(max)');
+-
+-select @xml.query('.').query('.');
+-
+-SELECT @hierarchyid.GetAncestor(2) parent_id;
+-SELECT convert(hierarchyid, '/1/1/2').GetAncestor(2) parent;
+-select @geometry.STEndPoint() EndPt;
+-
+-SELECT convert(hierarchyid, '/1/1/2').GetAncestor(2).GetAncestor(2) parent;
+-
+-SELECT @geography.STArea() area;
+-SELECT @geography.STDistance(@other_geography) dist;
+diff --git a/test/fixtures/dialects/tsql/datatype_methods.yml b/test/fixtures/dialects/tsql/datatype_methods.yml
+deleted file mode 100644
+index 84f79b281..000000000
+--- a/test/fixtures/dialects/tsql/datatype_methods.yml
++++ /dev/null
+@@ -1,340 +0,0 @@
+-# YML test files are auto-generated from SQL files and should not be edited by
+-# hand. To help enforce this, the "hash" field in the file must match a hash
+-# computed by SQLFluff when running the tests. Please run
+-# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+-# altering SQL files.
+-_hash: 6460a8172bf65721979ac308a716a5996261c90b1bbdc29ca98b9576290be7c5
+-file:
+-  batch:
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            function:
+-              function_name:
+-                naked_identifier: SomeSchema
+-                dot: .
+-                function_name_identifier: XValue
+-              function_contents:
+-                bracketed:
+-                  start_bracket: (
+-                  end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            function:
+-              function_name:
+-                naked_identifier: SomeSchema
+-                dot: .
+-                function_name_identifier: Value
+-              function_contents:
+-                bracketed:
+-                  start_bracket: (
+-                  end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            function:
+-              function_name:
+-                naked_identifier: SomeSchema
+-                dot: .
+-                function_name_identifier: VALUE
+-              function_contents:
+-                bracketed:
+-                  start_bracket: (
+-                  end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-        - keyword: SELECT
+-        - select_clause_element:
+-            column_reference:
+-              naked_identifier: SomeColumn
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: value
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    end_bracket: )
+-        - comma: ','
+-        - select_clause_element:
+-            column_reference:
+-              naked_identifier: SomeColumn
+-        from_clause:
+-          keyword: FROM
+-          from_expression:
+-            from_expression_element:
+-              table_expression:
+-                table_reference:
+-                - naked_identifier: dbo
+-                - dot: .
+-                - naked_identifier: SomeTable
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            column_reference:
+-              parameter: '@XML'
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: value
+-                function_contents:
+-                  bracketed:
+-                  - start_bracket: (
+-                  - expression:
+-                      quoted_literal: "'.'"
+-                  - comma: ','
+-                  - expression:
+-                      quoted_literal: "'nvarchar(max)'"
+-                  - end_bracket: )
+-            alias_expression:
+-              naked_identifier: Col1
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            expression:
+-              function:
+-                function_name:
+-                  keyword: CONVERT
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    data_type:
+-                      keyword: xml
+-                    comma: ','
+-                    expression:
+-                      quoted_literal: "N'<r></r>'"
+-                    end_bracket: )
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: value
+-                function_contents:
+-                  bracketed:
+-                  - start_bracket: (
+-                  - expression:
+-                      quoted_literal: "'.'"
+-                  - comma: ','
+-                  - expression:
+-                      quoted_literal: "'nvarchar(max)'"
+-                  - end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            expression:
+-              bracketed:
+-                start_bracket: (
+-                expression:
+-                  select_statement:
+-                    select_clause:
+-                      keyword: SELECT
+-                      select_clause_element:
+-                        function:
+-                          function_name:
+-                            keyword: CONVERT
+-                          function_contents:
+-                            bracketed:
+-                              start_bracket: (
+-                              data_type:
+-                                keyword: xml
+-                              comma: ','
+-                              expression:
+-                                quoted_literal: "N'<r></r>'"
+-                              end_bracket: )
+-                end_bracket: )
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: value
+-                function_contents:
+-                  bracketed:
+-                  - start_bracket: (
+-                  - expression:
+-                      quoted_literal: "'.'"
+-                  - comma: ','
+-                  - expression:
+-                      quoted_literal: "'nvarchar(max)'"
+-                  - end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: select
+-          select_clause_element:
+-            column_reference:
+-            - parameter: '@xml'
+-            - datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: query
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    expression:
+-                      quoted_literal: "'.'"
+-                    end_bracket: )
+-            - datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: query
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    expression:
+-                      quoted_literal: "'.'"
+-                    end_bracket: )
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            column_reference:
+-              parameter: '@hierarchyid'
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: GetAncestor
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    expression:
+-                      integer_literal: '2'
+-                    end_bracket: )
+-            alias_expression:
+-              naked_identifier: parent_id
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            expression:
+-              function:
+-                function_name:
+-                  keyword: convert
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    data_type:
+-                      keyword: hierarchyid
+-                    comma: ','
+-                    expression:
+-                      quoted_literal: "'/1/1/2'"
+-                    end_bracket: )
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: GetAncestor
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    expression:
+-                      integer_literal: '2'
+-                    end_bracket: )
+-            alias_expression:
+-              naked_identifier: parent
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: select
+-          select_clause_element:
+-            column_reference:
+-              parameter: '@geometry'
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: STEndPoint
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    end_bracket: )
+-            alias_expression:
+-              naked_identifier: EndPt
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            expression:
+-            - function:
+-                function_name:
+-                  keyword: convert
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    data_type:
+-                      keyword: hierarchyid
+-                    comma: ','
+-                    expression:
+-                      quoted_literal: "'/1/1/2'"
+-                    end_bracket: )
+-            - datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: GetAncestor
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    expression:
+-                      integer_literal: '2'
+-                    end_bracket: )
+-            - datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: GetAncestor
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    expression:
+-                      integer_literal: '2'
+-                    end_bracket: )
+-            alias_expression:
+-              naked_identifier: parent
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            column_reference:
+-              parameter: '@geography'
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: STArea
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    end_bracket: )
+-            alias_expression:
+-              naked_identifier: area
+-  - statement_terminator: ;
+-  - statement:
+-      select_statement:
+-        select_clause:
+-          keyword: SELECT
+-          select_clause_element:
+-            column_reference:
+-              parameter: '@geography'
+-              datatype_method:
+-                dot: .
+-                datatype_method_name_identifier: STDistance
+-                function_contents:
+-                  bracketed:
+-                    start_bracket: (
+-                    expression:
+-                      parameter: '@other_geography'
+-                    end_bracket: )
+-            alias_expression:
+-              naked_identifier: dist
+-  - statement_terminator: ;
+diff --git a/test/fixtures/dialects/tsql/xml_schema_collection.sql b/test/fixtures/dialects/tsql/xml_schema_collection.sql
+deleted file mode 100644
+index 1af38fa60..000000000
+--- a/test/fixtures/dialects/tsql/xml_schema_collection.sql
++++ /dev/null
+@@ -1,61 +0,0 @@
+--- CREATE
+-CREATE XML SCHEMA COLLECTION dbo.SomeXmlSchemaCollection
+-    AS N'<?xml version="1.0" encoding="UTF-16"?>
+-<xsd:schema targetNamespace="https://schemas.microsoft.com/sqlserver/2004/07/adventure-works/ProductModelManuInstructions"
+-   xmlns          ="https://schemas.microsoft.com/sqlserver/2004/07/adventure-works/ProductModelManuInstructions"
+-   elementFormDefault="qualified"
+-   attributeFormDefault="unqualified"
+-   xmlns:xsd="http://www.w3.org/2001/XMLSchema" >
+-
+-    <xsd:complexType name="StepType" mixed="true" >
+-        <xsd:choice  minOccurs="0" maxOccurs="unbounded" >
+-            <xsd:element name="tool" type="xsd:string" />
+-            <xsd:element name="material" type="xsd:string" />
+-            <xsd:element name="blueprint" type="xsd:string" />
+-            <xsd:element name="specs" type="xsd:string" />
+-            <xsd:element name="diag" type="xsd:string" />
+-        </xsd:choice>
+-    </xsd:complexType>
+-
+-    <xsd:element  name="root">
+-        <xsd:complexType mixed="true">
+-            <xsd:sequence>
+-                <xsd:element name="Location" minOccurs="1" maxOccurs="unbounded">
+-                    <xsd:complexType mixed="true">
+-                        <xsd:sequence>
+-                            <xsd:element name="step" type="StepType" minOccurs="1" maxOccurs="unbounded" />
+-                        </xsd:sequence>
+-                        <xsd:attribute name="LocationID" type="xsd:integer" use="required"/>
+-                        <xsd:attribute name="SetupHours" type="xsd:decimal" use="optional"/>
+-                        <xsd:attribute name="MachineHours" type="xsd:decimal" use="optional"/>
+-                        <xsd:attribute name="LaborHours" type="xsd:decimal" use="optional"/>
+-                        <xsd:attribute name="LotSize" type="xsd:decimal" use="optional"/>
+-                    </xsd:complexType>
+-                </xsd:element>
+-            </xsd:sequence>
+-        </xsd:complexType>
+-    </xsd:element>
+-</xsd:schema>';
+-
+-DECLARE @MySchemaCollection AS NVARCHAR (MAX) = '';
+-CREATE XML SCHEMA COLLECTION AnotherXmlSchemaCollection
+-    AS @MySchemaCollection;
+-GO
+-
+--- ALTER
+-ALTER XML SCHEMA COLLECTION MyColl ADD '
+-  <schema xmlns="http://www.w3.org/2001/XMLSchema"
+-         targetNamespace="https://MySchema/test_xml_schema">
+-     <element name="anotherElement" type="byte"/>
+- </schema>';
+- DECLARE @NewItem AS NVARCHAR (MAX) = '
+-  <schema xmlns="http://www.w3.org/2001/XMLSchema"
+-         targetNamespace="https://MySchema/test_xml_schema">
+-     <element name="yetAnotherElement" type="byte"/>
+- </schema>';
+- ALTER XML SCHEMA COLLECTION dbo.MyColl ADD @NewItem;
+-
+--- DROP
+-DROP XML SCHEMA COLLECTION dbo.SomeXmlSchemaCollection;
+-DROP XML SCHEMA COLLECTION AnotherXmlSchemaCollection;
+-GO
+diff --git a/test/fixtures/dialects/tsql/xml_schema_collection.yml b/test/fixtures/dialects/tsql/xml_schema_collection.yml
+deleted file mode 100644
+index 1e7e6f63b..000000000
+--- a/test/fixtures/dialects/tsql/xml_schema_collection.yml
++++ /dev/null
+@@ -1,149 +0,0 @@
+-# YML test files are auto-generated from SQL files and should not be edited by
+-# hand. To help enforce this, the "hash" field in the file must match a hash
+-# computed by SQLFluff when running the tests. Please run
+-# `python test/generate_parse_fixture_yml.py`  to generate them after adding or
+-# altering SQL files.
+-_hash: 704f1501b685e078765e1b850a8a32fe8fc25ac519a15e70738a6aad3a23c5be
+-file:
+-- batch:
+-  - statement:
+-      create_xml_schema_collection_statement:
+-      - keyword: CREATE
+-      - keyword: XML
+-      - keyword: SCHEMA
+-      - keyword: COLLECTION
+-      - object_reference:
+-        - naked_identifier: dbo
+-        - dot: .
+-        - naked_identifier: SomeXmlSchemaCollection
+-      - keyword: AS
+-      - expression:
+-          quoted_literal: "N'<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<xsd:schema\
+-            \ targetNamespace=\"https://schemas.microsoft.com/sqlserver/2004/07/adventure-works/ProductModelManuInstructions\"\
+-            \n   xmlns          =\"https://schemas.microsoft.com/sqlserver/2004/07/adventure-works/ProductModelManuInstructions\"\
+-            \n   elementFormDefault=\"qualified\"\n   attributeFormDefault=\"unqualified\"\
+-            \n   xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" >\n\n    <xsd:complexType\
+-            \ name=\"StepType\" mixed=\"true\" >\n        <xsd:choice  minOccurs=\"\
+-            0\" maxOccurs=\"unbounded\" >\n            <xsd:element name=\"tool\"\
+-            \ type=\"xsd:string\" />\n            <xsd:element name=\"material\" type=\"\
+-            xsd:string\" />\n            <xsd:element name=\"blueprint\" type=\"xsd:string\"\
+-            \ />\n            <xsd:element name=\"specs\" type=\"xsd:string\" />\n\
+-            \            <xsd:element name=\"diag\" type=\"xsd:string\" />\n     \
+-            \   </xsd:choice>\n    </xsd:complexType>\n\n    <xsd:element  name=\"\
+-            root\">\n        <xsd:complexType mixed=\"true\">\n            <xsd:sequence>\n\
+-            \                <xsd:element name=\"Location\" minOccurs=\"1\" maxOccurs=\"\
+-            unbounded\">\n                    <xsd:complexType mixed=\"true\">\n \
+-            \                       <xsd:sequence>\n                            <xsd:element\
+-            \ name=\"step\" type=\"StepType\" minOccurs=\"1\" maxOccurs=\"unbounded\"\
+-            \ />\n                        </xsd:sequence>\n                      \
+-            \  <xsd:attribute name=\"LocationID\" type=\"xsd:integer\" use=\"required\"\
+-            />\n                        <xsd:attribute name=\"SetupHours\" type=\"\
+-            xsd:decimal\" use=\"optional\"/>\n                        <xsd:attribute\
+-            \ name=\"MachineHours\" type=\"xsd:decimal\" use=\"optional\"/>\n    \
+-            \                    <xsd:attribute name=\"LaborHours\" type=\"xsd:decimal\"\
+-            \ use=\"optional\"/>\n                        <xsd:attribute name=\"LotSize\"\
+-            \ type=\"xsd:decimal\" use=\"optional\"/>\n                    </xsd:complexType>\n\
+-            \                </xsd:element>\n            </xsd:sequence>\n       \
+-            \ </xsd:complexType>\n    </xsd:element>\n</xsd:schema>'"
+-  - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-      - keyword: DECLARE
+-      - parameter: '@MySchemaCollection'
+-      - keyword: AS
+-      - data_type:
+-          keyword: NVARCHAR
+-          bracketed_arguments:
+-            bracketed:
+-              start_bracket: (
+-              keyword: MAX
+-              end_bracket: )
+-      - comparison_operator:
+-          raw_comparison_operator: '='
+-      - expression:
+-          quoted_literal: "''"
+-  - statement_terminator: ;
+-  - statement:
+-      create_xml_schema_collection_statement:
+-      - keyword: CREATE
+-      - keyword: XML
+-      - keyword: SCHEMA
+-      - keyword: COLLECTION
+-      - object_reference:
+-          naked_identifier: AnotherXmlSchemaCollection
+-      - keyword: AS
+-      - expression:
+-          parameter: '@MySchemaCollection'
+-  - statement_terminator: ;
+-  - go_statement:
+-      keyword: GO
+-- batch:
+-  - statement:
+-      alter_xml_schema_collection_statement:
+-      - keyword: ALTER
+-      - keyword: XML
+-      - keyword: SCHEMA
+-      - keyword: COLLECTION
+-      - object_reference:
+-          naked_identifier: MyColl
+-      - keyword: ADD
+-      - expression:
+-          quoted_literal: "'\n  <schema xmlns=\"http://www.w3.org/2001/XMLSchema\"\
+-            \n         targetNamespace=\"https://MySchema/test_xml_schema\">\n   \
+-            \  <element name=\"anotherElement\" type=\"byte\"/>\n </schema>'"
+-  - statement_terminator: ;
+-  - statement:
+-      declare_segment:
+-      - keyword: DECLARE
+-      - parameter: '@NewItem'
+-      - keyword: AS
+-      - data_type:
+-          keyword: NVARCHAR
+-          bracketed_arguments:
+-            bracketed:
+-              start_bracket: (
+-              keyword: MAX
+-              end_bracket: )
+-      - comparison_operator:
+-          raw_comparison_operator: '='
+-      - expression:
+-          quoted_literal: "'\n  <schema xmlns=\"http://www.w3.org/2001/XMLSchema\"\
+-            \n         targetNamespace=\"https://MySchema/test_xml_schema\">\n   \
+-            \  <element name=\"yetAnotherElement\" type=\"byte\"/>\n </schema>'"
+-  - statement_terminator: ;
+-  - statement:
+-      alter_xml_schema_collection_statement:
+-      - keyword: ALTER
+-      - keyword: XML
+-      - keyword: SCHEMA
+-      - keyword: COLLECTION
+-      - object_reference:
+-        - naked_identifier: dbo
+-        - dot: .
+-        - naked_identifier: MyColl
+-      - keyword: ADD
+-      - expression:
+-          parameter: '@NewItem'
+-  - statement_terminator: ;
+-  - statement:
+-      drop_xml_schema_collection_statement:
+-      - keyword: DROP
+-      - keyword: XML
+-      - keyword: SCHEMA
+-      - keyword: COLLECTION
+-      - object_reference:
+-        - naked_identifier: dbo
+-        - dot: .
+-        - naked_identifier: SomeXmlSchemaCollection
+-  - statement_terminator: ;
+-  - statement:
+-      drop_xml_schema_collection_statement:
+-      - keyword: DROP
+-      - keyword: XML
+-      - keyword: SCHEMA
+-      - keyword: COLLECTION
+-      - object_reference:
+-          naked_identifier: AnotherXmlSchemaCollection
+-  - statement_terminator: ;
+-  - go_statement:
+-      keyword: GO

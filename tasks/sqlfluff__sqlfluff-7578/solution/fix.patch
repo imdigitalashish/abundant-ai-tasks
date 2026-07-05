@@ -1,0 +1,361 @@
+diff --git a/src/sqlfluff/core/parser/parsers.py b/src/sqlfluff/core/parser/parsers.py
+index 285eee861..e6ff19e7f 100644
+--- a/src/sqlfluff/core/parser/parsers.py
++++ b/src/sqlfluff/core/parser/parsers.py
+@@ -285,13 +285,17 @@ class RegexParser(BaseParser):
+         anti_template: Optional[str] = None,
+         trim_chars: Optional[tuple[str, ...]] = None,
+         casefold: Optional[Callable[[str], str]] = None,
++        ignore_case: bool = True,
+     ):
+         # Store the optional anti-template
+         self.template = template
+         self.anti_template = anti_template
++        self.ignore_case = ignore_case
+         # Compile regexes upfront to avoid repeated overhead
+-        self._anti_template = regex.compile(anti_template or r"", regex.IGNORECASE)
+-        self._template = regex.compile(template, regex.IGNORECASE)
++        self._anti_template = regex.compile(
++            anti_template or r"", regex.IGNORECASE if ignore_case else 0
++        )
++        self._template = regex.compile(template, regex.IGNORECASE if ignore_case else 0)
+         super().__init__(
+             raw_class=raw_class,
+             type=type,
+@@ -320,10 +324,9 @@ class RegexParser(BaseParser):
+     ) -> MatchResult:
+         """Match against this matcher.
+ 
+-        NOTE: This method uses .raw_upper and so case sensitivity is
+-        not supported.
++        NOTE: This method's case sensitivity is based on objects ignore_case property
+         """
+-        _raw = segments[idx].raw_upper
++        _raw = segments[idx].raw_upper if self.ignore_case else segments[idx].raw
+         result = self._template.match(_raw)
+         if result:
+             result_string = result.group(0)
+diff --git a/src/sqlfluff/dialects/dialect_tsql.py b/src/sqlfluff/dialects/dialect_tsql.py
+index 780eaafb4..2f041bce3 100644
+--- a/src/sqlfluff/dialects/dialect_tsql.py
++++ b/src/sqlfluff/dialects/dialect_tsql.py
+@@ -42,6 +42,7 @@ from sqlfluff.core.parser import (
+ )
+ from sqlfluff.dialects import dialect_ansi as ansi
+ from sqlfluff.dialects.dialect_tsql_keywords import (
++    DATATYPE_METHODS,
+     FUTURE_RESERVED_KEYWORDS,
+     RESERVED_KEYWORDS,
+     UNRESERVED_KEYWORDS,
+@@ -59,9 +60,11 @@ tsql_dialect = ansi_dialect.copy_as(
+ tsql_dialect.sets("reserved_keywords").clear()
+ tsql_dialect.sets("unreserved_keywords").clear()
+ tsql_dialect.sets("future_reserved_keywords").clear()
++tsql_dialect.sets("datatype_methods").clear()
+ tsql_dialect.sets("reserved_keywords").update(RESERVED_KEYWORDS)
+ tsql_dialect.sets("unreserved_keywords").update(UNRESERVED_KEYWORDS)
+ tsql_dialect.sets("future_reserved_keywords").update(FUTURE_RESERVED_KEYWORDS)
++tsql_dialect.sets("datatype_methods").update(DATATYPE_METHODS)
+ 
+ # Set the datetime units
+ tsql_dialect.sets("datetime_units").clear()
+@@ -501,6 +504,14 @@ tsql_dialect.add(
+     ActionParameterSegment=RegexParser(
+         r"\$ACTION", CodeSegment, type="action_parameter"
+     ),
++    DatatypeMethodNameIdentifierSegment=SegmentGenerator(
++        lambda dialect: RegexParser(
++            r"^(" + r"|".join(sorted(dialect.sets("datatype_methods"))) + r")$",
++            CodeSegment,
++            type="datatype_method_name_identifier",
++            ignore_case=False,
++        )
++    ),
+ )
+ 
+ tsql_dialect.replace(
+@@ -851,6 +862,9 @@ class StatementSegment(ansi.StatementSegment):
+             Ref("CreateSynonymStatementSegment"),
+             Ref("DropSynonymStatementSegment"),
+             Ref("CreateServerRoleStatementSegment"),
++            Ref("CreateXmlSchemaCollectionStatementSegment"),
++            Ref("AlterXmlSchemaCollectionStatementSegment"),
++            Ref("DropXmlSchemaCollectionStatementSegment"),
+             # DML Data Manipulation Language
+             # https://learn.microsoft.com/en-us/sql/t-sql/queries/queries
+             Ref("BulkInsertStatementSegment"),
+@@ -1540,6 +1554,33 @@ class LessThanOrEqualToSegment(CompositeComparisonOperatorSegment):
+     )
+ 
+ 
++class FunctionNameSegment(BaseSegment):
++    """Function name, including any prefix bits, e.g. project or schema.
++
++    Override in TSQL to exclude DatatypeMethodNameIdentifierSegment
++    """
++
++    type = "function_name"
++    match_grammar: Matchable = Sequence(
++        # Project name, schema identifier, etc.
++        AnyNumberOf(
++            Sequence(
++                Ref("SingleIdentifierGrammar"),
++                Ref("DotSegment"),
++            ),
++            terminators=[Ref("BracketedSegment")],
++        ),
++        # Base function name
++        OneOf(
++            Ref("FunctionNameIdentifierSegment"),
++            Ref("QuotedIdentifierSegment"),
++            exclude=Ref("DatatypeMethodNameIdentifierSegment"),
++            terminators=[Ref("BracketedSegment")],
++        ),
++        allow_gaps=False,
++    )
++
++
+ class NotEqualToSegment(CompositeComparisonOperatorSegment):
+     """Not equal to operator.
+ 
+@@ -3195,18 +3236,20 @@ class ObjectReferenceSegment(ansi.ObjectReferenceSegment):
+ 
+     Update ObjectReferenceSegment to only allow dot separated SingleIdentifierGrammar
+     So Square Bracketed identifiers can be matched.
++    And add support for datatype methods
+     """
+ 
+     # match grammar (allow whitespace)
+     match_grammar: Matchable = Sequence(
+         Ref("SingleIdentifierGrammar"),
+         AnyNumberOf(
+-            Sequence(
+-                Ref("DotSegment"),
+-                Ref("SingleIdentifierGrammar", optional=True),
++            OneOf(
++                Ref("DatatypeMethodSegment"),
++                Sequence(
++                    Ref("DotSegment"),
++                    Ref("SingleIdentifierGrammar", optional=True),
++                ),
+             ),
+-            min_times=0,
+-            max_times=3,
+         ),
+     )
+ 
+@@ -3531,7 +3574,14 @@ class DatatypeSegment(BaseSegment):
+             "TIMESTAMP",
+             "ROWVERSION",
+             "UNIQUEIDENTIFIER",
+-            "XML",
++            Sequence(
++                "XML",
++                Bracketed(
++                    OneOf("DOCUMENT", "CONTENT", optional=True),
++                    Ref("ObjectReferenceSegment"),
++                    optional=True,
++                ),
++            ),
+             "JSON",
+             # Spatial types
+             "GEOGRAPHY",
+@@ -4762,6 +4812,18 @@ class RankFunctionContentsSegment(BaseSegment):
+     )
+ 
+ 
++class DatatypeMethodSegment(BaseSegment):
++    """Datatype Method segment."""
++
++    type = "datatype_method"
++
++    match_grammar: Matchable = Sequence(
++        Ref("DotSegment"),
++        Ref("DatatypeMethodNameIdentifierSegment"),
++        Ref("FunctionContentsSegment"),
++    )
++
++
+ class FunctionSegment(BaseSegment):
+     """A scalar or aggregate function.
+ 
+@@ -8217,6 +8279,58 @@ class CreateServerRoleStatementSegment(ansi.CreateRoleStatementSegment):
+     )
+ 
+ 
++class CreateXmlSchemaCollectionStatementSegment(BaseSegment):
++    """A `CREATE XML SCHEMA COLLECTION` statement.
++
++    https://learn.microsoft.com/en-us/sql/t-sql/statements/create-xml-schema-collection-transact-sql?view=sql-server-ver17
++    """
++
++    type = "create_xml_schema_collection_statement"
++    match_grammar = Sequence(
++        "CREATE",
++        "XML",
++        "SCHEMA",
++        "COLLECTION",
++        Ref("ObjectReferenceSegment"),
++        "AS",
++        Ref("ExpressionSegment"),
++    )
++
++
++class AlterXmlSchemaCollectionStatementSegment(BaseSegment):
++    """A `ALTER XML SCHEMA COLLECTION` statement.
++
++    https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-xml-schema-collection-transact-sql
++    """
++
++    type = "alter_xml_schema_collection_statement"
++    match_grammar = Sequence(
++        "ALTER",
++        "XML",
++        "SCHEMA",
++        "COLLECTION",
++        Ref("ObjectReferenceSegment"),
++        "ADD",
++        Ref("ExpressionSegment"),
++    )
++
++
++class DropXmlSchemaCollectionStatementSegment(BaseSegment):
++    """A `DROP XML SCHEMA COLLECTION` statement.
++
++    https://learn.microsoft.com/en-us/sql/t-sql/statements/drop-xml-schema-collection-transact-sql?view=sql-server-ver17
++    """
++
++    type = "drop_xml_schema_collection_statement"
++    match_grammar = Sequence(
++        "DROP",
++        "XML",
++        "SCHEMA",
++        "COLLECTION",
++        Ref("ObjectReferenceSegment"),
++    )
++
++
+ class CreateLoginStatementSegment(BaseSegment):
+     """A `CREATE LOGIN` statement.
+ 
+@@ -9055,7 +9169,13 @@ class ExpressionSegment(BaseSegment):
+     type = "expression"
+ 
+     match_grammar: Matchable = OneOf(
+-        Ref("Expression_A_Grammar"), Ref("NextValueSequenceSegment")
++        Sequence(
++            Ref("Expression_A_Grammar"),
++            AnyNumberOf(
++                Ref("DatatypeMethodSegment"),
++            ),
++        ),
++        Ref("NextValueSequenceSegment"),
+     )
+ 
+ 
+diff --git a/src/sqlfluff/dialects/dialect_tsql_keywords.py b/src/sqlfluff/dialects/dialect_tsql_keywords.py
+index 39b11e326..bcde0600f 100644
+--- a/src/sqlfluff/dialects/dialect_tsql_keywords.py
++++ b/src/sqlfluff/dialects/dialect_tsql_keywords.py
+@@ -582,6 +582,7 @@ UNRESERVED_KEYWORDS = [
+     "CONTINUE_AFTER_ERROR",
+     "CONNECTION_OPTIONS",
+     "CONTAINED",
++    "CONTENT",
+     "COUNT_ROWS",
+     "CONTAINMENT",
+     "CONTEXT_INFO",
+@@ -623,6 +624,7 @@ UNRESERVED_KEYWORDS = [
+     "DISABLED",
+     "DISTRIBUTION",
+     "DISABLE_BROKER",
++    "DOCUMENT",
+     "DROP_EXISTING",
+     "DROPCLEANBUFFERS",
+     "DURABILITY",
+@@ -1051,3 +1053,85 @@ UNRESERVED_KEYWORDS = [
+     "VECTOR",
+     "VERIFY_CLONEDB",
+ ]
++
++# DataType Methods
++# Unlike normal keywords datatype methods are case sensitive
++# grouped by datatype and geometry/spatial data classification
++DATATYPE_METHODS = [
++    # xml methods
++    # https://learn.microsoft.com/en-us/sql/t-sql/xml/xml-data-type-methods
++    "exist",
++    "modify",
++    "nodes",
++    "query",
++    "value",
++    # hierarchyid methods
++    # https://learn.microsoft.com/en-us/sql/t-sql/data-types/hierarchyid-data-type-method-reference
++    "GetAncestor",
++    "GetLevel",
++    "GetReparentedValue",
++    "GetRoot",
++    "IsDescendantOf",
++    "Parse",
++    "ToString",
++    # geometry (spatial data) methods
++    # https://learn.microsoft.com/en-us/sql/t-sql/spatial-geometry/ogc-methods-on-geometry-instances
++    # Shape properties
++    "STArea",
++    "STLength",
++    "STBoundary",
++    "STCentroid",
++    "STEnvelope",
++    "STConvexHull",
++    # Geometry representation
++    "STAsBinary",
++    "STAsText",
++    # Geometry type information
++    "STGeometryType",
++    "STDimension",
++    "STSrid",
++    # Point and curve access
++    "STStartPoint",
++    "STEndPoint",
++    "STPointN",
++    "STPointOnSurface",
++    "STCurveN",
++    "STCurveToLine",
++    "STX",
++    "STY",
++    # Polygon ring access
++    "STExteriorRing",
++    "STInteriorRingN",
++    "STNumInteriorRing",
++    # Collection access
++    "STGeometryN",
++    "STNumGeometries",
++    "STNumPoints",
++    "STNumCurves",
++    # Spatial relationship tests
++    "STContains",
++    "STCrosses",
++    "STDisjoint",
++    "STEquals",
++    "STIntersects",
++    "STOverlaps",
++    "STRelate",
++    "STTouches",
++    "STWithin",
++    "STDistance",
++    # Spatial operations
++    "STBuffer",
++    "STDifference",
++    "STIntersection",
++    "STSymDifference",
++    "STUnion",
++    # Validity tests
++    "STIsClosed",
++    "STIsEmpty",
++    "STIsRing",
++    "STIsSimple",
++    "STIsValid",
++    # geography methods share the same ST-prefixed names as geometry methods
++    # and are already covered by the geometry section above.
++    # https://learn.microsoft.com/en-us/sql/t-sql/spatial-geography/ogc-methods-on-geography-instances
++]
