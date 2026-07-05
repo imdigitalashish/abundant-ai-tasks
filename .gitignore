@@ -1,0 +1,6 @@
+.env
+logs/
+.swegen/
+~$*
+.DS_Store
+__pycache__/
