@@ -1,0 +1,19 @@
+# Deep-domain candidates: compilers, query engines, type checkers,
+# schedulers, numerics — domains where fixes require real reasoning.
+# Python
+sympy/sympy
+python/mypy
+dask/dask
+tobymao/sqlglot
+astropy/astropy
+# Rust
+apache/datafusion
+astral-sh/ruff
+nushell/nushell
+# C++
+duckdb/duckdb
+# Go
+etcd-io/etcd
+# TypeScript/JS
+vitejs/vite
+statelyai/xstate
