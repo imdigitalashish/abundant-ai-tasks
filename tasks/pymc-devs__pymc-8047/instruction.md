@@ -1,6 +1,12 @@
-`pm.sample_smc` fails or behaves poorly when used with multiple cores, especially for models that include custom PyTensor Ops (e.g., created via `pytensor.compile.ops.as_op`) or other non-trivially picklable components.
+`pm.sample_smc` has multiple multiprocessing-related failures and regressions that show up when `cores > 1`, especially on platforms that use the `spawn` start method (notably Windows/macOS in some environments) and when models include non-standard Python objects (custom PyTensor ops or black-box likelihoods).
 
-When running parallel SMC sampling (e.g., `pm.sample_smc(..., cores=2)`), PyMC currently attempts to serialize/deserialize objects needed by worker processes in a way that breaks for custom ops defined in `__main__`. A common failure is:
+One reproducible crash happens when a model uses a custom PyTensor op created with `pytensor.compile.ops.as_op`. When sampling with `pm.sample_smc(..., cores=2)` (or any value > 1), worker processes fail while deserializing the model/op, raising:
+
+```
+AttributeError: module '__main__' has no attribute 'twice'
+```
+
+Example:
 
 ```python
 import pymc as pm
@@ -14,26 +20,28 @@ def twice(x):
 with pm.Model() as model:
     x = pm.Normal('x', mu=[0, 0], sigma=1)
     y = twice(x)
-    pm.Normal('z', mu=y, observed=[1, 1])
+    z = pm.Normal('z', mu=y, observed=[1, 1])
 
     pm.sample_smc(10, cores=2)
 ```
 
-Instead of sampling, this can crash in multiprocessing with an error like:
+Expected behavior: parallel SMC should run successfully with `cores > 1` even when the model contains an `as_op` custom op (and more generally, when it contains Python-callable likelihood components), producing a valid trace just like `cores=1`.
 
-```
-AttributeError: module '__main__' has no attribute 'twice'
-```
+Actual behavior: parallel SMC attempts to serialize/deserialize objects in a way that requires the custom op to be importable from `__main__` by name in the worker process, which is not reliable under multiprocessing. This causes the sampling run to fail.
 
-The expected behavior is that `pm.sample_smc` works with `cores>1` for models that use custom `as_op`/wrapped python Ops, without requiring users to move those functions into importable modules.
+In addition to the crash above, `sample_smc` should not compile PyTensor functions in worker processes. Compilation is not thread-safe and can lead to large startup delays, uneven chain starts, or intermittent stalls/hangs near the final SMC stage. Parallel SMC should initialize/compile the SMC kernel deterministically in the main process and then distribute whatever is needed to workers so that workers can start sampling promptly and finish reliably.
 
-Additionally, `pm.sample_smc` has experienced regressions where parallel chains start slowly or sampling can appear to hang/stall near the final stage (notably after progress-bar related changes). Parallel execution should not trigger expensive or unsafe compilation work inside worker processes, and it should not deadlock or stall at the end of sampling.
+Finally, the SMC progress bar behavior should be consistent with the general `pm.sample` progress bar interface:
 
-Fix `pm.sample_smc` parallelization so that:
+- `progressbar=True` should show split-chain progress.
+- `progressbar="combined"` should run in combined mode.
+- `progressbar="combined+stats"` should enable combined mode and include full stats.
+- `progressbar=False` should disable progress display.
 
-- Parallel sampling (`cores>1`) does not crash due to pickling/serialization of custom Ops (including functions defined in `__main__`).
-- The core SMC sampling routine used by worker processes can be invoked without needing to pickle the full model or other fragile objects.
-- Compilation or initialization work that is not safe or efficient to do in parallel workers is handled in a way that avoids long chain start delays and prevents final-stage stalls.
-- The public API supports controlling the multiprocessing context used for SMC sampling (so users on platforms that default to spawning can still run successfully), and parallel execution should remain correct when running sequentially (`cores=1`) as well.
+A `MCMCProgressBarManager` created with `progressbar=True` must default to split mode (combined progress disabled) and full stats enabled, while `progressbar="combined"` must enable combined progress and disable full stats. When running in a compatible notebook environment that supports a marimo backend, the manager should select that backend and render HTML containing the expected structural elements for the progress table/bars and per-chain failing indicators when a chain is marked as failing.
 
-After the fix, the example above should run successfully with `cores=2` and produce a valid SMC trace/result, and parallel SMC sampling should not exhibit the reported hangs or large startup delays compared to earlier versions under typical workloads.
+Overall, `pm.sample_smc` should support:
+
+- Correct parallel execution with `cores > 1` without pickling errors for common “black-box” model components like `as_op`.
+- Safe and efficient multiprocessing startup (no worker-side compilation, no long chain startup delays, no intermittent final-stage stalls).
+- Progress bar configuration/selection behavior consistent with the existing progress bar manager semantics used by `pm.sample`.
