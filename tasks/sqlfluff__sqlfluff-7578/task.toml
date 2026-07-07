@@ -4,7 +4,7 @@ artifacts = []
 [metadata]
 difficulty = "hard"
 category = "feature"
-tags = [ "python", "library", "parsing",]
+tags = [ "python", "library", "sqlfluff",]
 
 [verifier]
 timeout_sec = 600.0

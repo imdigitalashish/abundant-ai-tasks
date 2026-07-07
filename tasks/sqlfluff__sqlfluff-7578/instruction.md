@@ -1,52 +1,48 @@
-SQLFluff’s T-SQL dialect parser fails to parse several valid T-SQL constructs related to XML schema collections, typed XML declarations, and datatype “method” calls. Attempting to lint/parse these statements produces a parse warning (e.g., SQLFluff(PRS)) even though the SQL is valid.
+SQLFluff’s TSQL dialect parser currently fails to parse several valid T-SQL constructs related to XML schema collections, typed XML, and datatype “method” calls. This manifests as parser warnings/errors (e.g., SQLFluff(PRS)) when linting or parsing statements that are valid in SQL Server.
 
-The parser must be updated so that the following T-SQL syntax is accepted and parsed successfully:
+The parser must be updated so that these statements parse successfully in the TSQL dialect:
 
-1) XML SCHEMA COLLECTION DDL statements
-- CREATE XML SCHEMA COLLECTION with a schema name (optionally schema-qualified) and an AS clause whose body can be either a string literal (often an N-prefixed Unicode string) or a variable.
-  Examples:
-  - CREATE XML SCHEMA COLLECTION dbo.SomeXmlSchemaCollection AS N'<schema ...>';
-  - DECLARE @MySchemaCollection AS NVARCHAR(MAX) = '';
-    CREATE XML SCHEMA COLLECTION AnotherXmlSchemaCollection AS @MySchemaCollection;
-- ALTER XML SCHEMA COLLECTION <name> ADD <xml_schema_source> where <xml_schema_source> can be a string literal or a variable.
-  Examples:
-  - ALTER XML SCHEMA COLLECTION MyColl ADD '<schema ...>';
-  - ALTER XML SCHEMA COLLECTION dbo.MyColl ADD @NewItem;
-- DROP XML SCHEMA COLLECTION <name>;
+1) XML schema collection DDL
+The dialect should recognize and parse the following statement forms:
+- `CREATE XML SCHEMA COLLECTION <schema_collection_name> AS <xml_schema_definition>`
+  where `<xml_schema_definition>` can be an `N'...'` string literal or a variable containing the schema text.
+- `ALTER XML SCHEMA COLLECTION <schema_collection_name> ADD <xml_schema_definition>`
+  where `<xml_schema_definition>` can be a string literal or a variable.
+- `DROP XML SCHEMA COLLECTION <schema_collection_name>`
 
-These statements should work both with and without schema qualification (e.g., dbo.SomeXmlSchemaCollection vs AnotherXmlSchemaCollection), and they may appear in scripts that include batch separators like GO.
+`<schema_collection_name>` should support multipart identifiers (e.g., `dbo.SomeXmlSchemaCollection`). Statements may appear in scripts with batch separators like `GO`.
 
 2) Typed XML declarations
-The parser must accept typed XML type specifications used in declarations, including optional DOCUMENT and schema-qualified schema collection names.
-Examples:
-- DECLARE @typed_xml XML (SomeSchemaCollection);
-- DECLARE @typed_xml XML (dbo.SomeSchemaCollection);
-- DECLARE @typed_xml XML ([dbo].[SomeSchemaCollection]);
-- DECLARE @typed_xml_document XML (DOCUMENT dbo.SomeSchemaCollection);
+The dialect should parse typed XML declarations, including schema-qualified and bracketed identifiers, and the optional `DOCUMENT` keyword:
+- `DECLARE @typed_xml XML (SomeSchemaCollection);`
+- `DECLARE @typed_xml XML (dbo.SomeSchemaCollection);`
+- `DECLARE @typed_xml XML ([dbo].[SomeSchemaCollection]);`
+- `DECLARE @typed_xml_document XML (DOCUMENT dbo.SomeSchemaCollection);`
+These should be treated as valid uses of the `XML` data type with a parenthesized schema collection reference.
 
-3) Datatype method-call expressions (XML, hierarchyid, geometry/geography, etc.)
-T-SQL supports calling methods on expressions using dot notation, e.g. <expression>.<MethodName>(...). The parser currently mis-parses or rejects these, and in some cases treats the method name like a normal function/identifier in a way that causes unsafe case normalization.
+3) Datatype method calls on expressions (XML, hierarchyid, spatial)
+The dialect should parse method-call syntax that appears as a dotted suffix on an expression, including when chained, and regardless of whether the left-hand side is a variable, column, function call, or a parenthesized subquery expression:
+- XML examples:
+  - `SELECT @XML.value('.', 'nvarchar(max)');`
+  - `SELECT CONVERT(xml, N'<r></r>').value('.','nvarchar(max)');`
+  - `SELECT (SELECT CONVERT(xml, N'<r></r>')).value('.','nvarchar(max)');`
+  - `SELECT @xml.query('.').query('.');` (chained)
+- hierarchyid examples:
+  - `SELECT @hierarchyid.GetAncestor(2);`
+  - `SELECT convert(hierarchyid, '/1/1/2').GetAncestor(2).GetAncestor(2);` (chained)
+- spatial examples:
+  - `SELECT @geometry.STEndPoint();`
+  - `SELECT @geography.STArea();`
+  - `SELECT @geography.STDistance(@other_geography);`
 
-The parser must correctly parse method calls in these forms:
-- Called on a column/variable:
-  - SELECT @XML.value('.', 'nvarchar(max)');
-  - SELECT SomeColumn.value();
-- Called on the result of a function:
-  - SELECT CONVERT(xml, N'<r></r>').value('.','nvarchar(max)');
-  - SELECT convert(hierarchyid, '/1/1/2').GetAncestor(2) parent;
-- Called on a subquery expression:
-  - SELECT (SELECT CONVERT(xml, N'<r></r>')).value('.','nvarchar(max)');
-- Chained method calls:
-  - SELECT convert(hierarchyid, '/1/1/2').GetAncestor(2).GetAncestor(2) parent;
-  - select @xml.query('.').query('.');
-- Other examples that should parse:
-  - SELECT @hierarchyid.GetAncestor(2) parent_id;
-  - select @geometry.STEndPoint() EndPt;
-  - SELECT @geography.STArea() area;
-  - SELECT @geography.STDistance(@other_geography) dist;
+A key requirement is that method names should be treated as case-sensitive tokens in the sense that SQLFluff must not normalize/auto-fix their casing as if they were regular keywords or standard functions. For example, all of these must parse as valid calls without SQLFluff rewriting the identifier case:
+- `SELECT SomeSchema.XValue();`
+- `SELECT SomeSchema.Value();`
+- `SELECT SomeSchema.VALUE();`
 
-Method names must be treated as method identifiers in this dot-call position so that SQLFluff does not rewrite their case during fixes. In particular, dotted method calls must support known method names (e.g., value, query, GetAncestor, STEndPoint, STArea, STDistance) and should not fail parsing due to case differences.
+Even though there can be ambiguity with user-defined functions that share names with known datatype methods, SQLFluff should prefer parsing dotted calls of the form `.<name>(...)` as method calls when `<name>` is a known datatype method name, to avoid unsafe case changes that could break code.
 
-Expected behavior: All examples above should parse cleanly under the tsql dialect with no PRS parse warnings, and method names in <expr>.<method>(...) should be preserved (not case-normalized) as written.
-
-Actual behavior: Parsing these statements currently triggers SQLFluff(PRS) warnings and/or mis-parses dotted datatype methods, sometimes treating the method name like a regular function identifier and allowing case-changing behavior that can break T-SQL method calls.
+After the fix, parsing/linting these constructs in the `tsql` dialect should complete without parser warnings, and the resulting parse tree should correctly represent:
+- XML schema collection CREATE/ALTER/DROP statements,
+- typed XML type specifications inside `DECLARE`,
+- dotted datatype method-call expressions (including chained calls) on arbitrary valid expressions.
