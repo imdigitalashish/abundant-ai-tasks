@@ -16,7 +16,7 @@ collect = []
 timeout_sec = 600.0
 
 [environment]
-network_mode = "public"
+allow_internet = false
 build_timeout_sec = 600.0
 os = "linux"
 cpus = 1
