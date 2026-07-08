@@ -1,0 +1,320 @@
+diff --git a/src/sqlfluff/cli/commands.py b/src/sqlfluff/cli/commands.py
+index 9c44cf6c3..75892c4a3 100644
+--- a/src/sqlfluff/cli/commands.py
++++ b/src/sqlfluff/cli/commands.py
+@@ -36,10 +36,9 @@ from sqlfluff.core import (
+     dialect_selector,
+ )
+ from sqlfluff.core.config import progress_bar_configuration
+-from sqlfluff.core.linter import LintingResult, ParsedString
++from sqlfluff.core.linter import LintingResult
+ from sqlfluff.core.linter.linted_file import TMP_PRS_ERROR_TYPES
+ from sqlfluff.core.plugin.host import get_plugin_manager
+-from sqlfluff.core.rules.noqa import IgnoreMask
+ from sqlfluff.core.types import Color, FormatType
+ 
+ 
+@@ -104,58 +103,6 @@ class StreamHandlerTqdm(logging.StreamHandler):
+             self.handleError(record)
+ 
+ 
+-def _get_filtered_parse_violations(
+-    parsed_string: ParsedString,
+-    linter: Linter,
+-    allowed_rules_ref_map_cache: Optional[dict[int, dict[str, set[str]]]] = None,
+-) -> list[SQLBaseError]:
+-    """Return parse and templating violations after applying ignore settings."""
+-    violations = list(parsed_string.violations)
+-    for violation in violations:
+-        violation.ignore_if_in(parsed_string.config.get("ignore"))
+-        violation.warning_if_in(parsed_string.config.get("warnings"))
+-
+-    disable_noqa_except: Optional[str] = parsed_string.config.get("disable_noqa_except")
+-    if parsed_string.config.get("disable_noqa") and not disable_noqa_except:
+-        return [v for v in violations if not v.ignore and not v.warning]
+-
+-    cache_key = id(parsed_string.config)
+-    if (
+-        allowed_rules_ref_map_cache is not None
+-        and cache_key in allowed_rules_ref_map_cache
+-    ):
+-        allowed_rules_ref_map = allowed_rules_ref_map_cache[cache_key]
+-    else:
+-        allowed_rules_ref_map = Linter.allowed_rule_ref_map(
+-            linter.get_rulepack(config=parsed_string.config).reference_map,
+-            disable_noqa_except,
+-        )
+-        if allowed_rules_ref_map_cache is not None:
+-            allowed_rules_ref_map_cache[cache_key] = allowed_rules_ref_map
+-
+-    root_variant = parsed_string.root_variant()
+-    if root_variant:
+-        assert root_variant.tree
+-        ignore_mask, ignore_violations = IgnoreMask.from_tree(
+-            root_variant.tree, allowed_rules_ref_map
+-        )
+-    else:
+-        ignore_mask, ignore_violations = IgnoreMask.from_source_with_dialect(
+-            parsed_string.source_str,
+-            parsed_string.config.get("dialect_obj"),
+-            allowed_rules_ref_map,
+-        )
+-
+-    for violation in ignore_violations:
+-        violation.ignore_if_in(parsed_string.config.get("ignore"))
+-        violation.warning_if_in(parsed_string.config.get("warnings"))
+-
+-    filtered_violations = [*violations, *ignore_violations]
+-    filtered_violations = [v for v in filtered_violations if not v.ignore]
+-    filtered_violations = ignore_mask.ignore_masked_violations(filtered_violations)
+-    return [v for v in filtered_violations if not v.warning]
+-
+-
+ def set_logging_level(
+     verbosity: int,
+     formatter: OutputStreamFormatter,
+@@ -1693,20 +1640,11 @@ def parse(
+ 
+     total_time = time.monotonic() - t0
+     violations_count = 0
+-    allowed_rules_ref_map_cache: dict[int, dict[str, set[str]]] = {}
+ 
+     # iterative print for human readout
+     if format == FormatType.human.value:
+         violations_count = formatter.print_out_violations_and_timing(
+-            output_stream,
+-            bench,
+-            code_only,
+-            total_time,
+-            verbose,
+-            parsed_strings,
+-            lambda parsed_string: _get_filtered_parse_violations(
+-                parsed_string, lnt, allowed_rules_ref_map_cache
+-            ),
++            output_stream, bench, code_only, total_time, verbose, parsed_strings
+         )
+     else:
+         parsed_strings_dict = []
+@@ -1715,11 +1653,7 @@ def parse(
+             # output of the parse command.
+             root_variant = parsed_string.root_variant()
+             # Updating violation count ensures the correct return code below.
+-            violations_count += len(
+-                _get_filtered_parse_violations(
+-                    parsed_string, lnt, allowed_rules_ref_map_cache
+-                )
+-            )
++            violations_count += len(parsed_string.violations)
+             if root_variant:
+                 assert root_variant.tree
+                 segments = root_variant.tree.as_record(
+diff --git a/src/sqlfluff/cli/formatters.py b/src/sqlfluff/cli/formatters.py
+index 9f93e9ba7..08cb6d693 100644
+--- a/src/sqlfluff/cli/formatters.py
++++ b/src/sqlfluff/cli/formatters.py
+@@ -3,7 +3,7 @@
+ import os
+ import sys
+ from io import StringIO
+-from typing import Callable, Optional, Union
++from typing import Optional, Union
+ 
+ import click
+ from colorama import Style
+@@ -684,9 +684,6 @@ class OutputStreamFormatter(FormatterInterface):
+         total_time: float,
+         verbose: int,
+         parsed_strings: list[ParsedString],
+-        violations_getter: Optional[
+-            Callable[[ParsedString], list[SQLBaseError]]
+-        ] = None,
+     ) -> int:
+         """Used by human formatting during the `sqlfluff parse` command."""
+         violations_count = 0
+@@ -728,11 +725,7 @@ class OutputStreamFormatter(FormatterInterface):
+                             self.colorize("...Failed to Parse...", Color.red)
+                         )
+ 
+-            violations = (
+-                violations_getter(parsed_string)
+-                if violations_getter
+-                else parsed_string.violations
+-            )
++            violations = parsed_string.violations
+             violations_count += len(violations)
+             if violations:
+                 output_stream.write("==== parsing violations ====")  # pragma: no cover
+diff --git a/src/sqlfluff/core/linter/linter.py b/src/sqlfluff/core/linter/linter.py
+index af514f6b2..0a77877ca 100644
+--- a/src/sqlfluff/core/linter/linter.py
++++ b/src/sqlfluff/core/linter/linter.py
+@@ -755,9 +755,13 @@ class Linter:
+                 allowed_rules_ref_map = cls.allowed_rule_ref_map(
+                     rule_pack.reference_map, disable_noqa_except
+                 )
+-                ignore_mask, ignore_violations = IgnoreMask.from_source_with_dialect(
++                ignore_mask, ignore_violations = IgnoreMask.from_source(
+                     parsed.source_str,
+-                    parsed.config.get("dialect_obj"),
++                    [
++                        lm
++                        for lm in parsed.config.get("dialect_obj").lexer_matchers
++                        if lm.name == "inline_comment"
++                    ][0],
+                     allowed_rules_ref_map,
+                 )
+                 violations += ignore_violations
+diff --git a/src/sqlfluff/core/rules/noqa.py b/src/sqlfluff/core/rules/noqa.py
+index 5b62257fb..d3aa70c05 100644
+--- a/src/sqlfluff/core/rules/noqa.py
++++ b/src/sqlfluff/core/rules/noqa.py
+@@ -3,7 +3,7 @@
+ import fnmatch
+ import logging
+ from dataclasses import dataclass
+-from typing import Any, Optional, Union, cast
++from typing import Optional, Union, cast
+ 
+ from sqlfluff.core.errors import SQLBaseError, SQLParseError, SQLUnusedNoQaWarning
+ from sqlfluff.core.parser import BaseSegment, RawSegment, RegexLexer
+@@ -214,31 +214,6 @@ class IgnoreMask:
+             linter_logger.info("Parsed noqa directives from file: %r", ignore_buff)
+         return cls(ignore_buff), violations
+ 
+-    @classmethod
+-    def from_source_with_dialect(
+-        cls,
+-        source: str,
+-        dialect: Any,
+-        reference_map: dict[str, set[str]],
+-    ) -> tuple["IgnoreMask", list[SQLBaseError]]:
+-        """Parse noqa directives from raw source using a dialect's comment matcher.
+-
+-        If a dialect does not define an ``inline_comment`` lexer matcher, return an
+-        empty ignore mask and no new violations so callers can continue without
+-        raising an unhelpful ``IndexError``.
+-        """
+-        inline_comment_regex = next(
+-            (
+-                cast(RegexLexer, matcher)
+-                for matcher in dialect.lexer_matchers
+-                if matcher.name == "inline_comment"
+-            ),
+-            None,
+-        )
+-        if inline_comment_regex is None:
+-            return cls([]), []
+-        return cls.from_source(source, inline_comment_regex, reference_map)
+-
+     # ### Application methods.
+ 
+     @staticmethod
+diff --git a/test/cli/commands_test.py b/test/cli/commands_test.py
+index 0afd94393..0b5458f4c 100644
+--- a/test/cli/commands_test.py
++++ b/test/cli/commands_test.py
+@@ -31,7 +31,6 @@ from sqlfluff.cli.commands import (
+     rules,
+     version,
+ )
+-from sqlfluff.core import FluffConfig, Linter
+ from sqlfluff.core.helpers.file import get_encoding
+ from sqlfluff.utils.testing.cli import invoke_assert_code
+ 
+@@ -837,67 +836,6 @@ def test__cli__command_lint_skip_ignore_files():
+     assert "LT12" in result.stdout.strip()
+ 
+ 
+-def test__cli__command_parse_respects_inline_noqa_for_prs():
+-    """Check parse command respects inline noqa suppression for PRS errors."""
+-    result = invoke_assert_code(
+-        args=[parse, ["-", "--dialect=mariadb"]],
+-        cli_input="SeLeCt  1 frm tBl ;    -- noqa",
+-    )
+-
+-    assert result.exit_code == 0
+-    assert "==== parsing violations ====" not in result.stdout
+-
+-
+-def test__cli__command_parse_disable_noqa_shows_prs():
+-    """Check parse command ignores inline noqa when disable_noqa is enabled."""
+-    result = invoke_assert_code(
+-        ret_code=1,
+-        args=[parse, ["-", "--dialect=mariadb", "--disable-noqa"]],
+-        cli_input="SeLeCt  1 frm tBl ;    -- noqa",
+-    )
+-
+-    assert "==== parsing violations ====" in result.stdout
+-    assert "PRS" in result.stdout
+-
+-
+-def test__get_filtered_parse_violations_caches_rulepack_per_config():
+-    """Check parse violation filtering reuses rulepack lookups for one config."""
+-    linter = Linter(config=FluffConfig(overrides={"dialect": "ansi"}))
+-    parsed_string = linter.parse_string("SELEC * FROM foo -- noqa: PRS")
+-    cache = {}
+-
+-    with patch.object(
+-        linter, "get_rulepack", wraps=linter.get_rulepack
+-    ) as get_rulepack:
+-        sqlfluff.cli.commands._get_filtered_parse_violations(
+-            parsed_string, linter, cache
+-        )
+-        sqlfluff.cli.commands._get_filtered_parse_violations(
+-            parsed_string, linter, cache
+-        )
+-
+-    assert get_rulepack.call_count == 1
+-
+-
+-def test__get_filtered_parse_violations_respects_warning_config_for_malformed_noqa():
+-    """Check malformed noqa parse errors are omitted when configured as warnings.
+-
+-    Unlike the lint path (which still displays warnings), the parse path has no
+-    separate warnings display mechanism, so warning-class violations are silently
+-    dropped from the returned list.
+-    """
+-    linter = Linter(
+-        config=FluffConfig(overrides={"dialect": "ansi", "warnings": "PRS"})
+-    )
+-    parsed_string = linter.parse_string("select 1 --noqa missing semicolon")
+-
+-    violations = sqlfluff.cli.commands._get_filtered_parse_violations(
+-        parsed_string, linter, {}
+-    )
+-
+-    assert violations == []
+-
+-
+ @pytest.mark.parametrize(
+     "command",
+     [
+diff --git a/test/core/rules/noqa_test.py b/test/core/rules/noqa_test.py
+index da969fb86..d94e7dc49 100644
+--- a/test/core/rules/noqa_test.py
++++ b/test/core/rules/noqa_test.py
+@@ -131,24 +131,6 @@ def test_parse_noqa_no_dups():
+     assert len(result.rules) == len(set(result.rules))
+ 
+ 
+-def test_from_source_with_dialect_no_inline_comment_matcher():
+-    """Fallback cleanly if a dialect has no inline_comment lexer matcher."""
+-
+-    class _DialectWithoutInlineComment:
+-        lexer_matchers = []
+-
+-    ignore_mask, violations = IgnoreMask.from_source_with_dialect(
+-        "SELECT 1 -- noqa: PRS",
+-        _DialectWithoutInlineComment(),
+-        dummy_rule_map,
+-    )
+-
+-    assert violations == []
+-    assert ignore_mask.ignore_masked_violations([DummyLintError(1)]) == [
+-        DummyLintError(1)
+-    ]
+-
+-
+ @pytest.mark.parametrize(
+     "noqa,violations,expected,used_noqas",
+     [
