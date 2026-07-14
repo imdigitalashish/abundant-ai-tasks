@@ -1,0 +1,2658 @@
+diff --git a/pymc/progress_bar/__init__.py b/pymc/progress_bar/__init__.py
+index fd99cb841..20653a95c 100644
+--- a/pymc/progress_bar/__init__.py
++++ b/pymc/progress_bar/__init__.py
+@@ -13,10 +13,8 @@
+ #   limitations under the License.
+ 
+ from pymc.progress_bar.progress import (
+-    MCMCProgressBarManager,
+     ProgressBarManager,
+     ProgressBarOptions,
+-    SMCProgressBarManager,
+     create_simple_progress,
+ )
+ from pymc.progress_bar.rich_progress import CustomProgress, default_progress_theme
+diff --git a/pymc/progress_bar/marimo_progress.py b/pymc/progress_bar/marimo_progress.py
+index 5dd6853ef..44b5bcce2 100644
+--- a/pymc/progress_bar/marimo_progress.py
++++ b/pymc/progress_bar/marimo_progress.py
+@@ -16,6 +16,7 @@ from time import perf_counter
+ from typing import Any, Self
+ 
+ from pymc.progress_bar.marimo_progress_css import DEFAULT_CSS
++from pymc.progress_bar.utils import compute_draw_speed
+ 
+ 
+ def format_time(seconds: float) -> str:
+@@ -95,22 +96,20 @@ class MarimoProgressBackend:
+ 
+     def __init__(
+         self,
+-        step_name: str,
+-        n_bars: int,
+-        total: int | float,
++        chains: int,
++        total_draws: int,
+         combined: bool,
+         full_stats: bool,
+         css_theme: str | None = None,
+     ):
+-        self.step_name = step_name
+-        self.n_bars = n_bars
+-        self.total = total
++        self.chains = chains
++        self.total_draws = total_draws
+         self.combined = combined
+         self.full_stats = full_stats
+         self._css_theme = DEFAULT_CSS if css_theme is None else css_theme
+ 
+         self._mo_replace: Callable[[object], None] | None = None
+-        self._task_state: list[dict[str, Any]] = []
++        self._chain_state: list[dict[str, Any]] = []
+         self._start_times: list[float] = []
+ 
+     @property
+@@ -132,63 +131,58 @@ class MarimoProgressBackend:
+         self._render()
+ 
+     def _initialize_tasks(self) -> None:
+-        """Initialize progress tracking state for all tasks."""
++        """Initialize progress tracking state for all chains."""
+         if self.combined:
+-            self._task_state = [
++            self._chain_state = [
+                 {
+-                    "completed": 0,
+-                    "total": self.total * self.n_bars,
++                    "draws": 0,
++                    "total": self.total_draws * self.chains,
+                     "failing": False,
+                     "stats": {},
+                 }
+             ]
+             self._start_times = [perf_counter()]
+         else:
+-            self._task_state = [
++            self._chain_state = [
+                 {
+-                    "completed": 0,
+-                    "total": self.total,
++                    "draws": 0,
++                    "total": self.total_draws,
+                     "failing": False,
+                     "stats": {},
+                 }
+-                for _ in range(self.n_bars)
++                for _ in range(self.chains)
+             ]
+-            self._start_times = [perf_counter() for _ in range(self.n_bars)]
++            self._start_times = [perf_counter() for _ in range(self.chains)]
+ 
+     def update(
+         self,
+-        task_id: int,
+-        advance: int | float,
++        chain_idx: int,
++        draw: int,
+         failing: bool,
+         stats: dict[str, Any],
+         is_last: bool,
+     ) -> None:
+-        """Update progress for a specific task.
++        """Update progress for a specific chain.
+ 
+         Parameters
+         ----------
+-        task_id : int
+-            Index of the progress bar being updated
+-        advance : int or float
+-            Amount to advance the progress bar by
++        chain_idx : int
++            Index of the chain being updated
++        draw : int
++            Current draw number
+         failing : bool
+-            Whether the task has encountered failures
++            Whether the chain has encountered failures
+         stats : dict
+             Statistics to display
+         is_last : bool
+             Whether this is the final update
+         """
+-        self._task_state[task_id]["completed"] += advance
+-        self._task_state[task_id]["failing"] = failing
+-        self._task_state[task_id]["stats"] = stats
++        self._chain_state[chain_idx]["draws"] = draw
++        self._chain_state[chain_idx]["failing"] = failing
++        self._chain_state[chain_idx]["stats"] = stats
+ 
+         if is_last:
+-            # Ensure bar is fully filled on completion
+-            total = self._task_state[task_id]["total"]
+-            completed = self._task_state[task_id]["completed"]
+-            remaining = total - completed
+-            if remaining > 0:
+-                self._task_state[task_id]["completed"] = total
++            self._chain_state[chain_idx]["draws"] = draw + 1 if not self.combined else draw
+ 
+         self._render()
+ 
+@@ -205,10 +199,10 @@ class MarimoProgressBackend:
+     def _render_html(self) -> str:
+         """Generate HTML for all progress bars as a table with headers."""
+         stat_keys = []
+-        if self.full_stats and self._task_state and self._task_state[0]["stats"]:
+-            stat_keys = list(self._task_state[0]["stats"].keys())
++        if self.full_stats and self._chain_state and self._chain_state[0]["stats"]:
++            stat_keys = list(self._chain_state[0]["stats"].keys())
+ 
+-        header_cells = ["Progress", self.step_name]
++        header_cells = ["Progress", "Draws"]
+ 
+         abbreviations = {
+             "divergences": "Div",
+@@ -230,8 +224,8 @@ class MarimoProgressBackend:
+         header_row = "<tr>" + "".join(f"<th>{h}</th>" for h in header_cells) + "</tr>"
+ 
+         data_rows = []
+-        for i, state in enumerate(self._task_state):
+-            data_rows.append(self._render_task_row(i, state, stat_keys))
++        for i, state in enumerate(self._chain_state):
++            data_rows.append(self._render_chain_row(i, state, stat_keys))
+ 
+         rows_html = "\n".join(data_rows)
+         return f"""
+@@ -242,23 +236,16 @@ class MarimoProgressBackend:
+             </table>
+         """
+ 
+-    def _render_task_row(self, task_id: int, state: dict[str, Any], stat_keys: list[str]) -> str:
+-        """Render a single task's progress as a table row."""
+-        completed = state["completed"]
++    def _render_chain_row(self, chain_idx: int, state: dict[str, Any], stat_keys: list[str]) -> str:
++        """Render a single chain's progress as a table row."""
++        draws = state["draws"]
+         total = state["total"]
+         failing = state["failing"]
+         stats = state["stats"]
+ 
+-        pct = (completed / total * 100) if total > 0 else 0
+-        elapsed = perf_counter() - self._start_times[task_id]
+-
+-        action = self.step_name.lower()
+-        speed = completed / max(elapsed, 1e-6)
+-        if speed > 1 or speed == 0:
+-            unit = f"{action}s/s"
+-        else:
+-            unit = f"s/{action}"
+-            speed = 1 / speed
++        pct = (draws / total * 100) if total > 0 else 0
++        elapsed = perf_counter() - self._start_times[chain_idx]
++        speed, unit = compute_draw_speed(elapsed, draws)
+ 
+         bar_class = "pymc-progress-bar"
+         if failing:
+@@ -268,7 +255,7 @@ class MarimoProgressBackend:
+ 
+         cells = [
+             f'<td><div class="pymc-progress-bar-container"><div class="{bar_class}" style="width: {pct:.1f}%"></div></div></td>',
+-            f"<td>{completed}/{total} ({pct:.0f}%)</td>",
++            f"<td>{draws}/{total} ({pct:.0f}%)</td>",
+         ]
+ 
+         for key in stat_keys:
+diff --git a/pymc/progress_bar/progress.py b/pymc/progress_bar/progress.py
+index 3cdb2634f..d31ae26a6 100644
+--- a/pymc/progress_bar/progress.py
++++ b/pymc/progress_bar/progress.py
+@@ -13,7 +13,6 @@
+ #   limitations under the License.
+ from __future__ import annotations
+ 
+-from abc import ABC, abstractmethod
+ from contextlib import nullcontext
+ from typing import TYPE_CHECKING, Any, Literal, Protocol, Self
+ 
+@@ -30,7 +29,6 @@ from pymc.progress_bar.rich_progress import (
+ )
+ 
+ if TYPE_CHECKING:
+-    from pymc.smc.kernels import SMC_KERNEL
+     from pymc.step_methods.compound import BlockedStep, CompoundStep
+ 
+ 
+@@ -58,8 +56,8 @@ class ProgressBackend(Protocol):
+ 
+     def update(
+         self,
+-        task_id: int,
+-        advance: int | float,
++        chain_idx: int,
++        draw: int,
+         failing: bool,
+         stats: dict[str, Any],
+         is_last: bool,
+@@ -70,28 +68,24 @@ class NullProgressBackend(nullcontext):
+     def update(self, *args, **kwargs): ...
+ 
+ 
+-class ProgressBarManager(ABC):
+-    """Abstract base class for progress bar managers.
++class ProgressBarManager:
++    """Manage progress bars displayed during sampling.
+ 
+-    This class handles the common logic for progress bar management including:
+-    - Environment detection (terminal vs marimo notebook)
+-    - Backend selection and initialization
+-    - Configuration parsing
++    This class automatically detects the execution environment and uses the
++    appropriate rendering backend:
++    - Rich-based terminal rendering for standard Python/Jupyter environments
++    - HTML rendering for marimo notebooks
+ 
+-    Subclasses implement sampling-specific logic like how to track progress
+-    and how to extract statistics from step methods.
++    The manager handles configuration parsing and stat extraction, delegating
++    the actual rendering to the appropriate backend.
+     """
+ 
+-    _backend: ProgressBackend
+-    _show_progress: bool
+-    combined_progress: bool
+-    full_stats: bool
+-    n_bars: int
+-    step_name: str = "Completed"
+-
+     def __init__(
+         self,
+-        n_bars: int,
++        step_method: BlockedStep | CompoundStep,
++        chains: int,
++        draws: int,
++        tune: int,
+         progressbar: bool | ProgressBarOptions = True,
+         progressbar_theme: Theme | str | None = None,
+     ):
+@@ -99,16 +93,21 @@ class ProgressBarManager(ABC):
+ 
+         Parameters
+         ----------
+-        n_bars : int
+-            Number of progress bars to draw
+-        progressbar : bool or ProgressBarOptions
++        step_method : BlockedStep or CompoundStep
++            The step method being used for sampling
++        chains : int
++            Number of chains being sampled
++        draws : int
++            Number of draws per chain
++        tune : int
++            Number of tuning steps per chain
++        progressbar : bool or ProgressBarType
+             Progress bar display mode
+-        progressbar_theme : Theme or str, optional
+-            Rich theme for terminal progress bars, or CSS string for marimo
++        progressbar_theme : Theme, optional
++            Rich theme for terminal progress bars
++        progressbar_css : str, optional
++            Path to custom CSS file for marimo progress bars
+         """
+-        self.n_bars = n_bars
+-        self._progressbar_theme = progressbar_theme
+-
+         match progressbar:
+             case True:
+                 self.combined_progress = False
+@@ -143,131 +142,42 @@ class ProgressBarManager(ABC):
+ 
+         self._show_progress = show_progress
+ 
+-    def _create_backend(
+-        self,
+-        total: int | float,
+-        progress_columns: list,
+-        progress_stats: dict[str, list[Any]],
+-    ) -> ProgressBackend:
+-        """Create the appropriate backend based on environment.
++        progress_columns, progress_stats = step_method._progressbar_config(chains)
++        self.progress_stats = progress_stats
++        self.update_stats_functions = step_method._make_progressbar_update_functions()
+ 
+-        Parameters
+-        ----------
+-        total : int
+-            Total number of progress units (draws, etc.)
+-        progress_columns : list
+-            Column definitions for the progress bar
+-        progress_stats : dict
+-            Initial statistics values by chain
+-
+-        Returns
+-        -------
+-        ProgressBackend
+-            The appropriate backend for the current environment
+-        """
+-        if not self._show_progress:
+-            return NullProgressBackend()
++        self.completed_draws = 0
++        self.total_draws = draws + tune
++        self.chains = chains
++        self._backend: ProgressBackend
++
++        if not show_progress:
++            self._backend = NullProgressBackend()
+         elif in_marimo_notebook():
+-            return MarimoProgressBackend(
+-                step_name=self.step_name,
+-                n_bars=1 if self.combined_progress else self.n_bars,
+-                total=total,
++            self._backend = MarimoProgressBackend(
++                chains=chains,
++                total_draws=self.total_draws,
+                 combined=self.combined_progress,
+                 full_stats=self.full_stats,
+-                css_theme=self._progressbar_theme
+-                if isinstance(self._progressbar_theme, str)
+-                else None,
++                css_theme=progressbar_theme if isinstance(progressbar_theme, str) else None,
+             )
+         else:
+-            return RichProgressBackend(
+-                step_name=self.step_name,
+-                n_bars=1 if self.combined_progress else self.n_bars,
+-                total=total,
++            self._backend = RichProgressBackend(
++                chains=chains,
++                total_draws=self.total_draws,
+                 combined=self.combined_progress,
+                 full_stats=self.full_stats,
+                 progress_columns=progress_columns,
+                 progress_stats=progress_stats,
+-                theme=self._progressbar_theme
+-                if isinstance(self._progressbar_theme, Theme)
+-                else None,
++                theme=progressbar_theme if isinstance(progressbar_theme, Theme) else None,
+             )
+ 
+-    def __enter__(self) -> Self:
+-        self._backend.__enter__()
+-        return self
++    def __enter__(self) -> ProgressBackend:
++        return self._backend.__enter__()
+ 
+     def __exit__(self, exc_type, exc_val, exc_tb):
+         return self._backend.__exit__(exc_type, exc_val, exc_tb)
+ 
+-    @abstractmethod
+-    def update(self, *args, **kwargs) -> None:
+-        """Update progress bar with new sampling statistics.
+-
+-        Subclasses must implement this with their specific signature.
+-        """
+-        ...
+-
+-
+-class MCMCProgressBarManager(ProgressBarManager):
+-    """Progress bar manager for MCMC sampling.
+-
+-    Tracks progress via draw count with support for tuning phases.
+-    """
+-
+-    step_name: str = "Draws"
+-
+-    def __init__(
+-        self,
+-        step_method: BlockedStep | CompoundStep,
+-        chains: int,
+-        draws: int,
+-        tune: int,
+-        progressbar: bool | ProgressBarOptions = True,
+-        progressbar_theme: Theme | str | None = None,
+-    ):
+-        """Initialize the MCMC progress bar manager.
+-
+-        Parameters
+-        ----------
+-        step_method : BlockedStep or CompoundStep
+-            The step method being used for sampling
+-        chains : int
+-            Number of chains being sampled
+-        draws : int
+-            Number of draws per chain
+-        tune : int
+-            Number of tuning steps per chain
+-        progressbar : bool or ProgressBarOptions
+-            Progress bar display mode
+-        progressbar_theme : Theme or str, optional
+-            Rich theme for terminal progress bars, or CSS string for marimo
+-        """
+-        super().__init__(
+-            n_bars=chains,
+-            progressbar=progressbar,
+-            progressbar_theme=progressbar_theme,
+-        )
+-
+-        progress_columns, progress_stats = step_method._progressbar_config(chains)
+-        progress_stats["draws"] = [0] * chains
+-
+-        self.progress_stats = progress_stats
+-        self.update_stats_functions = step_method._make_progressbar_update_functions()
+-
+-        self.completed_draws = 0
+-        self.total_draws = draws + tune
+-
+-        self._backend = self._create_backend(
+-            total=self.total_draws * chains if self.combined_progress else self.total_draws,
+-            progress_columns=progress_columns,
+-            progress_stats=progress_stats,
+-        )
+-
+-    @property
+-    def chains(self) -> int:
+-        """Number of chains being sampled."""
+-        return self.n_bars
+-
+     def _extract_stats(self, stats) -> tuple[bool, dict[str, Any]]:
+         """Extract and process stats from step methods."""
+         failing = False
+@@ -292,21 +202,7 @@ class MCMCProgressBarManager(ProgressBarManager):
+         return failing, all_step_stats
+ 
+     def update(self, chain_idx: int, is_last: bool, draw: int, tuning: bool, stats) -> None:
+-        """Update progress bar with new sampling statistics.
+-
+-        Parameters
+-        ----------
+-        chain_idx : int
+-            Index of the chain being updated
+-        is_last : bool
+-            Whether this is the final update
+-        draw : int
+-            Current draw number
+-        tuning : bool
+-            Whether the chain is in tuning phase
+-        stats : list
+-            Statistics from each step method
+-        """
++        """Update progress bar with new sampling statistics."""
+         if not self._show_progress:
+             return
+ 
+@@ -316,124 +212,16 @@ class MCMCProgressBarManager(ProgressBarManager):
+             chain_idx = 0
+ 
+         failing, all_step_stats = self._extract_stats(stats)
+-        all_step_stats["draws"] = draw
+ 
+         self._backend.update(
+-            task_id=chain_idx,
+-            advance=1,
++            chain_idx=chain_idx,
++            draw=draw,
+             failing=failing,
+             stats=all_step_stats,
+             is_last=is_last,
+         )
+ 
+ 
+-class SMCProgressBarManager(ProgressBarManager):
+-    """Progress bar manager for SMC sampling.
+-
+-    Unlike MCMC which tracks a fixed number of draws, SMC tracks progress
+-    via the beta parameter (inverse temperature) which goes from 0 to 1.
+-    """
+-
+-    step_name: str = "Stage"
+-
+-    def __init__(
+-        self,
+-        kernel: SMC_KERNEL,
+-        chains: int,
+-        progressbar: bool = True,
+-        progressbar_theme: Theme | str | None = None,
+-    ):
+-        """Initialize the SMC progress bar manager.
+-
+-        Parameters
+-        ----------
+-        kernel : SMC_KERNEL
+-            The SMC kernel being used
+-        chains : int
+-            Number of processes being run.
+-        progressbar : bool
+-            Whether to display the progress bar
+-        progressbar_theme : Theme or str, optional
+-            Rich theme for terminal progress bars, or CSS string for marimo
+-        """
+-        # SMC doesn't use combined/split modes - each chain runs independently
+-        # and beta goes from 0 to 1, so we force split mode with full stats
+-        super().__init__(
+-            n_bars=chains,
+-            progressbar=progressbar,
+-            progressbar_theme=progressbar_theme,
+-        )
+-        # Override base class settings for SMC-specific behavior
+-        self.combined_progress = False
+-        self.full_stats = True
+-
+-        progress_columns, progress_stats = kernel._progressbar_config(chains)
+-        progress_stats["stage"] = [0] * chains
+-
+-        self.progress_stats = progress_stats
+-        self.update_stats_functions = kernel._make_progressbar_update_functions()
+-
+-        self._backend = self._create_backend(
+-            total=1.0,
+-            progress_columns=progress_columns,
+-            progress_stats=progress_stats,
+-        )
+-
+-    @property
+-    def chains(self):
+-        return self.n_bars
+-
+-    def update(
+-        self,
+-        chain_idx: int,
+-        stage: int,
+-        beta: float,
+-        old_beta: float | None = None,
+-        is_last: bool = False,
+-    ) -> None:
+-        """Update a progress bar.
+-
+-        Parameters
+-        ----------
+-        chain_idx : int
+-            Index of the chain being updated
+-        stage : int
+-            Current stage number
+-        beta : float
+-            Current beta value (0 to 1)
+-        old_beta : float, optional
+-            Previous beta value, used to compute advancement
+-        is_last : bool
+-            Whether this is the last update for this chain
+-        """
+-        if not self._show_progress:
+-            return
+-
+-        stats = [{"beta": beta}]
+-        all_step_stats: dict[str, Any] = {}
+-
+-        chain_progress_stats = [
+-            update_stats_fn(step_stats)
+-            for update_stats_fn, step_stats in zip(self.update_stats_functions, stats, strict=True)
+-        ]
+-
+-        for step_stats in chain_progress_stats:
+-            for key, val in step_stats.items():
+-                all_step_stats[key] = val
+-
+-        all_step_stats["stage"] = stage
+-
+-        advance = beta - (old_beta if old_beta is not None else 0.0)
+-
+-        self._backend.update(
+-            task_id=chain_idx,
+-            advance=advance,
+-            failing=False,
+-            stats=all_step_stats,
+-            is_last=is_last,
+-        )
+-
+-
+ class SimpleProgressBackend(Protocol):
+     def __enter__(self) -> Self: ...
+ 
+diff --git a/pymc/progress_bar/rich_progress.py b/pymc/progress_bar/rich_progress.py
+index 6c980221e..c551c3c0a 100644
+--- a/pymc/progress_bar/rich_progress.py
++++ b/pymc/progress_bar/rich_progress.py
+@@ -31,6 +31,8 @@ from rich.style import Style
+ from rich.table import Column, Table
+ from rich.theme import Theme
+ 
++from pymc.progress_bar.utils import compute_draw_speed
++
+ default_progress_theme = Theme(
+     {
+         "bar.complete": "#1764f4",
+@@ -137,9 +139,8 @@ class RichProgressBackend:
+ 
+     def __init__(
+         self,
+-        step_name: str,
+-        n_bars: int,
+-        total: int | float,
++        chains: int,
++        total_draws: int,
+         combined: bool,
+         full_stats: bool,
+         progress_columns: list,
+@@ -150,12 +151,10 @@ class RichProgressBackend:
+ 
+         Parameters
+         ----------
+-        step_name : str
+-            Name of the unit of iteration (e.g., "draws", "particles")
+-        n_bars : int
+-            Number of progress bars to display
+-        total : int
+-            Total number of iterations per bar
++        chains : int
++            Number of chains being sampled
++        total_draws : int
++            Total number of draws per chain (including tuning)
+         combined : bool
+             Whether to show a single combined progress bar
+         full_stats : bool
+@@ -163,13 +162,12 @@ class RichProgressBackend:
+         progress_columns : list
+             Rich column definitions from step method
+         progress_stats : dict
+-            Initial values for statistics by task
++            Initial values for statistics by chain
+         theme : Theme, optional
+             Rich theme for styling
+         """
+-        self.step_name = step_name
+-        self.n_bars = n_bars
+-        self.total = total
++        self.chains = chains
++        self.total_draws = total_draws
+         self.combined = combined
+         self.full_stats = full_stats
+         self.progress_stats = progress_stats
+@@ -185,11 +183,9 @@ class RichProgressBackend:
+         progress_columns: list,
+         theme: Theme,
+     ) -> CustomProgress:
++        """Create the Rich progress bar with appropriate columns."""
+         columns: list[ProgressColumn] = [
+-            TextColumn(
+-                "{" + f"task.fields[{self.step_name.lower()}]" + "}",
+-                table_column=Column(self.step_name.title(), ratio=1),
+-            )
++            TextColumn("{task.fields[draws]}", table_column=Column("Draws", ratio=1))
+         ]
+ 
+         if self.full_stats:
+@@ -217,21 +213,25 @@ class RichProgressBackend:
+         )
+ 
+     def __enter__(self) -> Self:
++        """Enter the context manager and initialize tasks."""
+         self._progress.__enter__()
+         self._initialize_tasks()
+         return self
+ 
+     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        """Exit the context manager."""
+         self._progress.__exit__(exc_type, exc_val, exc_tb)
+ 
+     def _initialize_tasks(self) -> None:
++        """Initialize progress bar tasks for all chains."""
+         if self.combined:
+             self._tasks = [
+                 self._progress.add_task(
+                     "Sampling",
+                     completed=0,
+-                    total=self.total * self.n_bars - 1,
+-                    task_idx=0,
++                    draws=0,
++                    total=self.total_draws * self.chains - 1,
++                    chain_idx=0,
+                     sampling_speed=0,
+                     speed_unit="draws/s",
+                     failing=False,
+@@ -243,59 +243,51 @@ class RichProgressBackend:
+                 self._progress.add_task(
+                     "Sampling",
+                     completed=0,
+-                    total=self.total - 1,
+-                    task_idx=task_idx,
++                    draws=0,
++                    total=self.total_draws - 1,
++                    chain_idx=chain_idx,
+                     sampling_speed=0,
+                     speed_unit="draws/s",
+                     failing=False,
+-                    **{stat: value[task_idx] for stat, value in self.progress_stats.items()},
++                    **{stat: value[chain_idx] for stat, value in self.progress_stats.items()},
+                 )
+-                for task_idx in range(self.n_bars)
++                for chain_idx in range(self.chains)
+             ]
+ 
+     def update(
+         self,
+-        task_id: int,
+-        advance: int | float,
++        chain_idx: int,
++        draw: int,
+         failing: bool,
+         stats: dict[str, Any],
+         is_last: bool,
+     ) -> None:
+-        """Update a progress bar.
++        """Update progress bar for a specific chain.
+ 
+         Parameters
+         ----------
+-        task_id : int
+-            Index of the progress bar being updated
+-        advance : int or float
+-            Amount to advance the progress bar by
++        chain_idx : int
++            Index of the chain being updated
++        draw : int
++            Current draw number
+         failing : bool
+-            Whether the process has encountered failures
++            Whether the chain has encountered failures
+         stats : dict
+             Statistics to display
+         is_last : bool
+             Whether this is the final update
+         """
+-        rich_task_id = self._tasks[task_id]
+-        if rich_task_id is None:
++        task_id = self._tasks[chain_idx]
++        if task_id is None:
+             return
+ 
+-        self._progress.advance(rich_task_id, advance=advance)
+-
+-        task = self._progress.tasks[task_id]
+-        completed = task.completed
+-        elapsed = task.elapsed if task.elapsed is not None else 0.0
+-
+-        action = self.step_name.lower()
+-        speed = completed / max(elapsed, 1e-6)
+-        if speed > 1 or speed == 0:
+-            unit = f"{action}s/s"
+-        else:
+-            unit = f"s/{action}"
+-            speed = 1 / speed
++        elapsed = self._progress.tasks[chain_idx].elapsed
++        speed, unit = compute_draw_speed(elapsed if elapsed is not None else 0.0, draw)
+ 
+         self._progress.update(
+-            rich_task_id,
++            task_id,
++            completed=draw,
++            draws=draw,
+             sampling_speed=speed,
+             speed_unit=unit,
+             failing=failing,
+@@ -303,12 +295,9 @@ class RichProgressBackend:
+         )
+ 
+         if is_last:
+-            # Ensure bar is fully filled on completion
+-            remaining = task.total - task.completed if task.total else 0
+-            if remaining > 0:
+-                self._progress.advance(rich_task_id, advance=remaining)
+             self._progress.update(
+-                rich_task_id,
++                task_id,
++                draws=draw + 1 if not self.combined else draw,
+                 failing=failing,
+                 **stats,
+                 refresh=True,
+diff --git a/pymc/progress_bar/utils.py b/pymc/progress_bar/utils.py
+new file mode 100644
+index 000000000..f241d3d07
+--- /dev/null
++++ b/pymc/progress_bar/utils.py
+@@ -0,0 +1,24 @@
++#   Copyright 2025 - present The PyMC Developers
++#
++#   Licensed under the Apache License, Version 2.0 (the "License");
++#   you may not use this file except in compliance with the License.
++#   You may obtain a copy of the License at
++#
++#       http://www.apache.org/licenses/LICENSE-2.0
++#
++#   Unless required by applicable law or agreed to in writing, software
++#   distributed under the License is distributed on an "AS IS" BASIS,
++#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#   See the License for the specific language governing permissions and
++#   limitations under the License.
++def compute_draw_speed(elapsed: float, draws: int) -> tuple[float, str]:
++    """Compute sampling speed and appropriate unit (draws/s or s/draw)."""
++    speed = draws / max(elapsed, 1e-6)
++
++    if speed > 1 or speed == 0:
++        unit = "draws/s"
++    else:
++        unit = "s/draw"
++        speed = 1 / speed
++
++    return speed, unit
+diff --git a/pymc/sampling/mcmc.py b/pymc/sampling/mcmc.py
+index b063fe884..2a5ddf0ad 100644
+--- a/pymc/sampling/mcmc.py
++++ b/pymc/sampling/mcmc.py
+@@ -14,7 +14,6 @@
+ 
+ import contextlib
+ import logging
+-import multiprocessing
+ import pickle
+ import sys
+ import time
+@@ -54,11 +53,11 @@ from pymc.exceptions import SamplingError
+ from pymc.initial_point import PointType, StartDict, make_initial_point_fns_per_chain
+ from pymc.model import Model, modelcontext
+ from pymc.progress_bar import (
+-    MCMCProgressBarManager,
++    ProgressBarManager,
+     ProgressBarOptions,
+     default_progress_theme,
+ )
+-from pymc.sampling.parallel import Draw, _cpu_count, _initialize_multiprocessing_context
++from pymc.sampling.parallel import Draw, _cpu_count
+ from pymc.sampling.population import _sample_population
+ from pymc.stats.convergence import (
+     log_warning_stats,
+@@ -773,10 +772,27 @@ def sample(
+     if chains is None:
+         chains = max(2, cores)
+ 
+-    mp_ctx = _initialize_multiprocessing_context(mp_ctx, quiet=quiet)
+-    joined_blas_limiter, cores, num_blas_cores_per_worker = setup_cores_blas_cores(
+-        blas_cores, chains, cores, mp_ctx
+-    )
++    if blas_cores == "auto":
++        blas_cores = cores
++
++    cores = min(cores, chains)
++
++    num_blas_cores_per_chain: int | None
++    joined_blas_limiter: Callable[[], Any]
++
++    if blas_cores is None:
++        joined_blas_limiter = contextlib.nullcontext
++        num_blas_cores_per_chain = None
++    elif isinstance(blas_cores, int):
++
++        def joined_blas_limiter():
++            return threadpool_limits(limits=blas_cores)
++
++        num_blas_cores_per_chain = blas_cores // cores
++    else:
++        raise ValueError(
++            f"Invalid argument `blas_cores`, must be int, 'auto' or None: {blas_cores}"
++        )
+ 
+     if random_seed == -1:
+         raise ValueError(
+@@ -926,7 +942,7 @@ def sample(
+     }
+     parallel_args = {
+         "mp_ctx": mp_ctx,
+-        "blas_cores": num_blas_cores_per_worker,
++        "blas_cores": num_blas_cores_per_chain,
+     }
+ 
+     sample_args.update(kwargs)
+@@ -1007,45 +1023,6 @@ def sample(
+     )
+ 
+ 
+-def setup_cores_blas_cores(
+-    blas_cores: int | None | str,
+-    chains: int,
+-    cores: int,
+-    mp_ctx: multiprocessing.context.BaseContext,
+-) -> tuple[Callable[[], Any], int, int | None]:
+-    if isinstance(blas_cores, str) and blas_cores != "auto":
+-        raise ValueError(
+-            f"Invalid argument `blas_cores`, must be int, 'auto' or None: {blas_cores}"
+-        )
+-    if blas_cores == "auto":
+-        blas_cores = cores
+-
+-    cores = min(cores, chains)
+-
+-    num_blas_cores_per_worker: int | None
+-    joined_blas_limiter: Callable[[], Any]
+-
+-    if blas_cores is None:
+-        joined_blas_limiter = contextlib.nullcontext
+-        num_blas_cores_per_worker = None
+-
+-    elif isinstance(blas_cores, int):
+-        if mp_ctx.get_start_method() == "fork":
+-            # https://github.com/pymc-devs/pymc/issues/7354
+-            joined_blas_limiter = contextlib.nullcontext
+-        else:
+-
+-            def joined_blas_limiter():
+-                return threadpool_limits(limits=blas_cores)
+-
+-        num_blas_cores_per_worker = blas_cores // cores
+-    else:
+-        raise ValueError(
+-            f"Invalid argument `blas_cores`, must be int, 'auto' or None: {blas_cores}"
+-        )
+-    return joined_blas_limiter, cores, num_blas_cores_per_worker
+-
+-
+ def _sample_return(
+     *,
+     run: RunType | None,
+@@ -1225,7 +1202,7 @@ def _sample_many(
+         Step function
+     """
+     initial_step_state = step.sampling_state
+-    progress_manager = MCMCProgressBarManager(
++    progress_manager = ProgressBarManager(
+         step_method=step,
+         chains=chains,
+         draws=draws - kwargs.get("tune", 0),
+@@ -1262,7 +1239,7 @@ def _sample(
+     tune: int,
+     model: Model | None = None,
+     callback=None,
+-    progress_manager: MCMCProgressBarManager,
++    progress_manager: ProgressBarManager,
+     **kwargs,
+ ) -> None:
+     """Sample one chain (singleprocess).
+diff --git a/pymc/sampling/parallel.py b/pymc/sampling/parallel.py
+index cf3fd223e..e9578c165 100644
+--- a/pymc/sampling/parallel.py
++++ b/pymc/sampling/parallel.py
+@@ -34,7 +34,7 @@ from threadpoolctl import threadpool_limits
+ from pymc.backends.zarr import ZarrChain
+ from pymc.blocking import DictToArrayBijection
+ from pymc.exceptions import SamplingError
+-from pymc.progress_bar import MCMCProgressBarManager, default_progress_theme
++from pymc.progress_bar import ProgressBarManager, default_progress_theme
+ from pymc.util import (
+     RandomGeneratorState,
+     get_state_from_generator,
+@@ -77,28 +77,6 @@ def rebuild_exc(exc, tb):
+     return exc
+ 
+ 
+-def _initialize_multiprocessing_context(
+-    mp_ctx: str | multiprocessing.context.BaseContext | None, quiet: bool = False
+-) -> multiprocessing.context.BaseContext:
+-    if mp_ctx is None or isinstance(mp_ctx, str):
+-        # Closes issue https://github.com/pymc-devs/pymc/issues/3849
+-        # Related issue https://github.com/pymc-devs/pymc/issues/5339
+-        if mp_ctx is None and platform.system() == "Darwin":
+-            if platform.processor() == "arm":
+-                mp_ctx = "fork"
+-                if not quiet:
+-                    logger.debug(
+-                        "mp_ctx is set to 'fork' for MacOS with ARM architecture. "
+-                        + "This might cause unexpected behavior with JAX, which is inherently multithreaded."
+-                    )
+-            else:
+-                mp_ctx = "forkserver"
+-
+-        mp_ctx = multiprocessing.get_context(mp_ctx)
+-
+-    return mp_ctx
+-
+-
+ # Messages
+ # ('writing_done', is_last, sample_idx, tuning, stats)
+ # ('error', *exception_info)
+@@ -463,8 +441,22 @@ class ParallelSampler:
+     ):
+         if any(len(arg) != chains for arg in [rngs, start_points]):
+             raise ValueError(f"Number of rngs and start_points must be {chains}.")
++
+         if mp_ctx is None or isinstance(mp_ctx, str):
+-            mp_ctx = _initialize_multiprocessing_context(mp_ctx)
++            # Closes issue https://github.com/pymc-devs/pymc/issues/3849
++            # Related issue https://github.com/pymc-devs/pymc/issues/5339
++            if mp_ctx is None and platform.system() == "Darwin":
++                if platform.processor() == "arm":
++                    mp_ctx = "fork"
++                    logger.debug(
++                        "mp_ctx is set to 'fork' for MacOS with ARM architecture. "
++                        + "This might cause unexpected behavior with JAX, which is inherently multithreaded."
++                    )
++                else:
++                    mp_ctx = "forkserver"
++
++            mp_ctx = multiprocessing.get_context(mp_ctx)
++
+         step_method_pickled = None
+         zarr_chains_pickled = None
+         self.zarr_recording = False
+@@ -499,7 +491,7 @@ class ParallelSampler:
+         self._max_active = cores
+ 
+         self._in_context = False
+-        self._progress = MCMCProgressBarManager(
++        self._progress = ProgressBarManager(
+             step_method=step_method,
+             chains=chains,
+             draws=draws,
+diff --git a/pymc/smc/kernels.py b/pymc/smc/kernels.py
+index e183957f2..567b73f51 100644
+--- a/pymc/smc/kernels.py
++++ b/pymc/smc/kernels.py
+@@ -12,26 +12,23 @@
+ #   See the License for the specific language governing permissions and
+ #   limitations under the License.
+ import abc
++import sys
+ import warnings
+ 
+ from abc import ABC
+-from typing import TypeAlias
++from typing import TypeAlias, cast
+ 
+ import numpy as np
+ import pytensor.tensor as pt
+ 
+-from pytensor import shared
+ from pytensor.graph.replace import clone_replace
+-from pytensor.link.jax import JAXLinker
+-from pytensor.tensor.random.type import RandomGeneratorType
+-from rich.progress import TextColumn
+-from rich.table import Column
+ from scipy.special import logsumexp
+ from scipy.stats import multivariate_normal
+ 
++from pymc.backends.ndarray import NDArray
+ from pymc.blocking import DictToArrayBijection
+ from pymc.initial_point import make_initial_point_expression
+-from pymc.model import modelcontext
++from pymc.model import Point, modelcontext
+ from pymc.pytensorf import (
+     compile,
+     floatX,
+@@ -130,11 +127,6 @@ class SMC_KERNEL(ABC):
+ 
+     """
+ 
+-    stats_dtypes_shapes: dict[str, tuple[type, list]] = {
+-        "log_marginal_likelihood": (float, []),
+-        "beta": (float, []),
+-    }
+-
+     def __init__(
+         self,
+         draws=2000,
+@@ -177,110 +169,64 @@ class SMC_KERNEL(ABC):
+         if threshold < 0 or threshold > 1:
+             raise ValueError(f"Threshold value {threshold} must be between 0 and 1")
+         self.threshold = threshold
+-
+-        model = modelcontext(model)
++        self.model = model
+         self.rng = np.random.default_rng(seed=random_seed)
+ 
+-        self.variables = model.value_vars
++        self.model = modelcontext(model)
++        self.variables = self.model.value_vars
+ 
+         self.var_info: dict[str, tuple] = {}
+         self.tempered_posterior: np.ndarray
+-        self.prior_logp: np.ndarray | None = None
+-        self.likelihood_logp: np.ndarray | None = None
+-        self.tempered_posterior_logp: np.ndarray | None = None
+-        self.log_marginal_likelihood: float = 0.0
+-        self.beta = 0.0
++        self.prior_logp = None
++        self.likelihood_logp = None
++        self.tempered_posterior_logp = None
++        self.prior_logp_func = None
++        self.likelihood_logp_func = None
++        self.log_marginal_likelihood = 0
++        self.beta = 0
+         self.iteration = 0
+-        self.resampling_indexes: np.ndarray | None = None
++        self.resampling_indexes = None
+         self.weights = np.ones(self.draws) / self.draws
+-
+-        initial_point = model.initial_point(random_seed=self.rng.integers(2**30))
+-
+-        for v in self.variables:
+-            self.var_info[v.name] = (initial_point[v.name].shape, initial_point[v.name].size)
+-
+-        shared = make_shared_replacements(initial_point, self.variables, model)
+-        compile_kwargs = compile_kwargs if compile_kwargs is not None else {}
+-
+-        # If a model has no observed variables, the likelihood_logp will have unused inputs, which can be safely
+-        # ignored.
+-        compile_kwargs.update({"on_unused_input": "ignore"})
+-
+-        self.prior_logp_func = _logp_forw(
+-            initial_point, [model.varlogp], self.variables, shared, compile_kwargs
+-        )
+-        self.likelihood_logp_func = _logp_forw(
+-            initial_point, [model.datalogp], self.variables, shared, compile_kwargs
+-        )
+-
+-        prior_expression = make_initial_point_expression(
+-            free_rvs=model.free_RVs,
+-            rvs_to_transforms=model.rvs_to_transforms,
+-            initval_strategies={
+-                **model.rvs_to_initial_values,
+-            },
+-            default_strategy="prior",
+-            return_transformed=True,
+-        )
+-
+-        self._prior_expression = prior_expression
+-        self._prior_var_names = [model.rvs_to_values[rv].name for rv in model.free_RVs]
+-
+-    def set_rng(self, rng: np.random.Generator):
+-        """
+-        Copy compiled functions, updating their random number generators.
+-
+-        This is necessary because these functions were compiled once at initialization, then pickled
+-        and sent to worker processes. Each worker needs its own RNG state to ensure independent sampling,
+-        so we replace the shared RNGs in the compiled functions with new ones created from the provided `rng`.
+-
+-        This method copies the functions, so it is expensive and should only be called once per worker!
+-        """
+-
+-        def make_rng_swaps(fn, rng):
+-            shared_rngs = [
+-                var for var in fn.get_shared() if isinstance(var.type, RandomGeneratorType)
+-            ]
+-            n_shared_rngs = len(shared_rngs)
+-            if n_shared_rngs > 0 and isinstance(fn.maker.linker, JAXLinker):
+-                raise NotImplementedError(
+-                    f"JAX rngs cannot be replaced after compilation. {self}.set_rng will fail to "
+-                    f"properly update random seeds between chains, resulting in non-independent "
+-                    f"sampling."
+-                )
+-
+-            return {
+-                old_shared_rng: shared(new_rng, borrow=True)
+-                for old_shared_rng, new_rng in zip(
+-                    shared_rngs, rng.spawn(n_shared_rngs), strict=True
+-                )
+-            }
+-
+-        self.rng = rng
+-        self.prior_logp_func = self.prior_logp_func.copy(
+-            swap=make_rng_swaps(self.prior_logp_func, self.rng)
+-        )
+-        self.likelihood_logp_func = self.likelihood_logp_func.copy(
+-            swap=make_rng_swaps(self.likelihood_logp_func, self.rng)
+-        )
++        self.compile_kwargs = compile_kwargs if compile_kwargs is not None else {}
+ 
+     def initialize_population(self) -> dict[str, np.ndarray]:
+         """Create an initial population from the prior distribution."""
++        sys.stdout.write(" ")  # see issue #5828
+         with warnings.catch_warnings():
+             warnings.filterwarnings(
+                 "ignore", category=UserWarning, message="The effect of Potentials"
+             )
+ 
+-            prior_values = draw(self._prior_expression, draws=self.draws, random_seed=self.rng)
+-            dict_prior = dict(zip(self._prior_var_names, prior_values))
++            model = self.model
++
++            prior_expression = make_initial_point_expression(
++                free_rvs=model.free_RVs,
++                rvs_to_transforms=model.rvs_to_transforms,
++                initval_strategies={
++                    **model.rvs_to_initial_values,
++                },
++                default_strategy="prior",
++                return_transformed=True,
++            )
++            prior_values = draw(prior_expression, draws=self.draws, random_seed=self.rng)
++
++            names = [model.rvs_to_values[rv].name for rv in model.free_RVs]
++            dict_prior = {k: np.stack(v) for k, v in zip(names, prior_values)}
+ 
+-        return dict_prior
++        return cast(dict[str, np.ndarray], dict_prior)
+ 
+     def _initialize_kernel(self):
+-        """Initialize particles and compute their prior and likelihood logp.
++        """Create variables and logp function necessary to run SMC kernel.
++
++        This method should not be overwritten. If needed, use `setup_kernel`
++        instead.
+ 
+-        This method should not be overwritten. If needed, use `setup_kernel` instead.
+         """
++        # Create dictionary that stores original variables shape and size
++        initial_point = self.model.initial_point(random_seed=self.rng.integers(2**30))
++        for v in self.variables:
++            self.var_info[v.name] = (initial_point[v.name].shape, initial_point[v.name].size)
++        # Create particles bijection map
+         if self.start:
+             init_rnd = self.start
+         else:
+@@ -288,12 +234,21 @@ class SMC_KERNEL(ABC):
+ 
+         population = []
+         for i in range(self.draws):
+-            point = {v.name: init_rnd[v.name][i] for v in self.variables}
++            point = Point({v.name: init_rnd[v.name][i] for v in self.variables}, model=self.model)
+             population.append(DictToArrayBijection.map(point).data)
+ 
+         self.tempered_posterior = np.array(floatX(population))
+ 
+-        # Evaluate prior and likelihood for initial particles
++        # Initialize prior and likelihood log probabilities
++        shared = make_shared_replacements(initial_point, self.variables, self.model)
++
++        self.prior_logp_func = _logp_forw(
++            initial_point, [self.model.varlogp], self.variables, shared, self.compile_kwargs
++        )
++        self.likelihood_logp_func = _logp_forw(
++            initial_point, [self.model.datalogp], self.variables, shared, self.compile_kwargs
++        )
++
+         priors = [self.prior_logp_func(sample) for sample in self.tempered_posterior]
+         likelihoods = [self.likelihood_logp_func(sample) for sample in self.tempered_posterior]
+ 
+@@ -360,96 +315,57 @@ class SMC_KERNEL(ABC):
+         """Apply kernel-specific perturbation to the particles once per stage."""
+         pass
+ 
+-    @abc.abstractmethod
+     def sample_stats(self) -> SMCStats:
+         """Stats to be saved at the end of each stage.
+ 
+         These stats will be saved under `sample_stats` in the final InferenceData object.
+         """
+-        pass
+-
+-    def step(self) -> SMCStats:
+-        """Perform a single SMC stage: resample, tune, and mutate."""
+-        self.resample()
+-        self.tune()
+-        self.mutate()
+-
+-        return self.sample_stats()
++        return {
++            "log_marginal_likelihood": self.log_marginal_likelihood if self.beta == 1 else np.nan,
++            "beta": self.beta,
++        }
+ 
+-    @abc.abstractmethod
+     def sample_settings(self) -> SMCSettings:
+         """SMC_kernel settings to be saved once at the end of sampling.
+ 
+         These stats will be saved under `sample_stats` in the final InferenceData object.
+-        """
+-        pass
+ 
+-    def _reset_state(self):
+-        """Reset the sampling state for a new run."""
+-        self.tempered_posterior = np.empty(0)
+-        self.prior_logp = None
+-        self.likelihood_logp = None
+-        self.tempered_posterior_logp = None
+-        self.log_marginal_likelihood = 0.0
+-        self.beta = 0.0
+-        self.iteration = 0
+-        self.resampling_indexes = None
+-        self.weights = np.ones(self.draws) / self.draws
+-
+-    def initialize(self, start: dict | None, rng: np.random.Generator) -> None:
+-        """Initialize the kernel for sampling.
+-
+-        Parameters
+-        ----------
+-        start : dict or None
+-            Starting point in parameter space, or None to sample from prior.
+-        rng : np.random.Generator
+-            Random number generator for this chain.
+-        """
+-        self.start = start
+-        self.rng = rng
+-        self._reset_state()
+-        self.set_rng(rng)
+-        self._initialize_kernel()
+-        self.setup_kernel()
+-
+-    @staticmethod
+-    def _progressbar_config(n_chains=1):
+-        """Configure progress bar columns for SMC sampling.
+-
+-        Returns columns to display and initial stats values.
+         """
+-        columns = [
+-            TextColumn("{task.fields[beta]:.4f}", table_column=Column("Beta", ratio=1)),
+-        ]
+-
+-        stats = {
+-            "beta": [0.0] * n_chains,
++        return {
++            "_n_draws": self.draws,  # Default property name used in `SamplerReport`
++            "threshold": self.threshold,
+         }
+ 
+-        return columns, stats
+-
+-    @staticmethod
+-    def _make_progressbar_update_functions():
+-        """Create functions to update progress bar statistics."""
++    def _posterior_to_trace(self, chain=0) -> NDArray:
++        """Save results into a PyMC trace.
+ 
+-        def update_stats(stats):
+-            return {
+-                "beta": stats.get("beta", 0.0),
+-            }
+-
+-        return (update_stats,)
++        This method should not be overwritten.
++        """
++        length_pos = len(self.tempered_posterior)
++        varnames = [v.name for v in self.variables]
++
++        with self.model:
++            strace = NDArray(name=self.model.name)
++            strace.setup(length_pos, chain)
++        for i in range(length_pos):
++            value = []
++            size = 0
++            for var in self.variables:
++                shape, new_size = self.var_info[var.name]
++                var_samples = self.tempered_posterior[i][size : size + new_size]
++                # Round discrete variable samples. The rounded values were the ones
++                # actually used in the logp evaluations (see logp_forw)
++                if var.dtype in discrete_types:
++                    var_samples = np.round(var_samples).astype(var.dtype)
++                value.append(var_samples.reshape(shape))
++                size += new_size
++            strace.record(point=dict(zip(varnames, value)))
++        return strace
+ 
+ 
+ class IMH(SMC_KERNEL):
+     """Independent Metropolis-Hastings SMC_kernel."""
+ 
+-    stats_dtypes_shapes: dict[str, tuple[type, list]] = {
+-        "log_marginal_likelihood": (float, []),
+-        "beta": (float, []),
+-        "accept_rate": (float, []),
+-    }
+-
+     def __init__(self, *args, correlation_threshold=0.01, **kwargs):
+         """
+         Create the Independent Metropolis-Hastings SMC kernel object.
+@@ -523,19 +439,23 @@ class IMH(SMC_KERNEL):
+         self.acc_rate = np.mean(ac_)
+ 
+     def sample_stats(self) -> SMCStats:
+-        return {
+-            "log_marginal_likelihood": self.log_marginal_likelihood if self.beta == 1 else np.nan,
+-            "beta": self.beta,
+-            "accept_rate": self.acc_rate,
+-        }
++        stats = super().sample_stats()
++        stats.update(
++            {
++                "accept_rate": self.acc_rate,
++            }
++        )
++        return stats
+ 
+     def sample_settings(self) -> SMCSettings:
+-        return {
+-            "_n_draws": self.draws,
+-            "threshold": self.threshold,
+-            "_n_tune": self.n_steps,
+-            "correlation_threshold": self.correlation_threshold,
+-        }
++        stats = super().sample_settings()
++        stats.update(
++            {
++                "_n_tune": self.n_steps,  # Default property name used in `SamplerReport`
++                "correlation_threshold": self.correlation_threshold,
++            }
++        )
++        return stats
+ 
+ 
+ class Pearson:
+@@ -554,13 +474,6 @@ class Pearson:
+ class MH(SMC_KERNEL):
+     """Metropolis-Hastings SMC_kernel."""
+ 
+-    stats_dtypes_shapes: dict[str, tuple[type, list]] = {
+-        "log_marginal_likelihood": (float, []),
+-        "beta": (float, []),
+-        "mean_accept_rate": (float, []),
+-        "mean_proposal_scale": (float, []),
+-    }
+-
+     def __init__(self, *args, correlation_threshold=0.01, **kwargs):
+         """
+         Create a Metropolis-Hastings SMC kernel.
+@@ -647,20 +560,24 @@ class MH(SMC_KERNEL):
+         self.chain_acc_rate = np.mean(ac_, axis=0)
+ 
+     def sample_stats(self) -> SMCStats:
+-        return {
+-            "log_marginal_likelihood": self.log_marginal_likelihood if self.beta == 1 else np.nan,
+-            "beta": self.beta,
+-            "mean_accept_rate": self.chain_acc_rate.mean(),
+-            "mean_proposal_scale": self.proposal_scales.mean(),
+-        }
++        stats = super().sample_stats()
++        stats.update(
++            {
++                "mean_accept_rate": self.chain_acc_rate.mean(),
++                "mean_proposal_scale": self.proposal_scales.mean(),
++            }
++        )
++        return stats
+ 
+     def sample_settings(self) -> SMCSettings:
+-        return {
+-            "_n_draws": self.draws,
+-            "threshold": self.threshold,
+-            "_n_tune": self.n_steps,
+-            "correlation_threshold": self.correlation_threshold,
+-        }
++        stats = super().sample_settings()
++        stats.update(
++            {
++                "_n_tune": self.n_steps,  # Default property name used in `SamplerReport`
++                "correlation_threshold": self.correlation_threshold,
++            }
++        )
++        return stats
+ 
+ 
+ def systematic_resampling(weights, rng):
+diff --git a/pymc/smc/parallel.py b/pymc/smc/parallel.py
+deleted file mode 100644
+index f72b6e6ae..000000000
+--- a/pymc/smc/parallel.py
++++ /dev/null
+@@ -1,431 +0,0 @@
+-#   Copyright 2026 - present The PyMC Developers
+-#
+-#   Licensed under the Apache License, Version 2.0 (the "License");
+-#   you may not use this file except in compliance with the License.
+-#   You may obtain a copy of the License at
+-#
+-#       http://www.apache.org/licenses/LICENSE-2.0
+-#
+-#   Unless required by applicable law or agreed to in writing, software
+-#   distributed under the License is distributed on an "AS IS" BASIS,
+-#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-#   See the License for the specific language governing permissions and
+-#   limitations under the License.
+-import logging
+-import multiprocessing
+-import time
+-
+-from collections import namedtuple
+-from collections.abc import Sequence
+-from contextlib import nullcontext
+-
+-import cloudpickle
+-import numpy as np
+-
+-from rich.theme import Theme
+-from threadpoolctl import threadpool_limits
+-
+-from pymc.progress_bar import SMCProgressBarManager, default_progress_theme
+-from pymc.sampling.parallel import ExceptionWithTraceback, ParallelSamplingError
+-from pymc.smc.kernels import SMC_KERNEL
+-from pymc.util import RandomGeneratorState, get_state_from_generator, random_generator_from_state
+-
+-logger = logging.getLogger(__name__)
+-
+-SMCResult = namedtuple(
+-    "SMCResult",
+-    [
+-        "chain",
+-        "is_last",
+-        "stage",
+-        "beta",
+-        "tempered_posterior",
+-        "var_info",
+-        "variables",
+-        "sample_stats",
+-        "sample_settings",
+-    ],
+-)
+-
+-
+-class _SMCProcess:
+-    """Separate process for each SMC chain.
+-
+-    Follows the pattern from parallel.py but adapted for SMC sampling.
+-    """
+-
+-    def __init__(
+-        self,
+-        name: str,
+-        msg_pipe,
+-        kernel,
+-        start,
+-        rng_state: RandomGeneratorState,
+-        chain: int,
+-        mp_start_method: str,
+-        blas_cores: int | None,
+-    ):
+-        self._msg_pipe = msg_pipe
+-        self._kernel = kernel
+-        self._start = start
+-        self._rng = random_generator_from_state(rng_state)
+-        self.chain = chain
+-        self._mp_start_method = mp_start_method
+-        self._blas_cores = blas_cores
+-
+-    def _unpickle_objects(self):
+-        """Unpickle kernel and start point."""
+-        self._kernel = cloudpickle.loads(self._kernel)
+-        if self._start is not None:
+-            self._start = cloudpickle.loads(self._start)
+-
+-    def run(self):
+-        with (
+-            nullcontext()
+-            if self._mp_start_method == "fork"
+-            else threadpool_limits(limits=self._blas_cores)
+-        ):
+-            self._unpickle_objects()
+-
+-            try:
+-                self._run_smc()
+-            except KeyboardInterrupt:
+-                pass
+-            except BaseException as e:
+-                e = ExceptionWithTraceback(e, e.__traceback__)
+-                self._msg_pipe.send(("error", e))
+-                self._wait_for_abortion()
+-            finally:
+-                self._msg_pipe.close()
+-
+-    def _wait_for_abortion(self):
+-        """Wait for abort message from main process."""
+-        while True:
+-            msg = self._recv_msg()
+-            if msg[0] == "abort":
+-                break
+-
+-    def _recv_msg(self):
+-        """Receive message from main process."""
+-        return self._msg_pipe.recv()
+-
+-    def _run_smc(self):
+-        """Run the SMC sampling algorithm."""
+-        msg = self._recv_msg()
+-        if msg[0] == "abort":
+-            raise KeyboardInterrupt()
+-        if msg[0] != "start":
+-            raise ValueError("Unexpected msg " + msg[0])
+-
+-        smc = self._kernel
+-        smc.initialize(self._start, self._rng)
+-
+-        stage = 0
+-        sample_stats: dict[str, list] = {stat: [] for stat in smc.stats_dtypes_shapes}  # type: ignore[annotation-unchecked]
+-
+-        while smc.beta < 1:
+-            smc.update_beta_and_weights()
+-
+-            self._msg_pipe.send(("progress", stage, smc.beta))
+-
+-            msg = self._recv_msg()
+-            if msg[0] == "abort":
+-                raise KeyboardInterrupt()
+-            elif msg[0] != "continue":
+-                raise ValueError("Unknown message " + msg[0])
+-
+-            for stat, value in smc.step().items():
+-                sample_stats[stat].append(value)
+-
+-            stage += 1
+-
+-        result = cloudpickle.dumps(
+-            (
+-                stage,
+-                smc.beta,
+-                smc.tempered_posterior,
+-                smc.var_info,
+-                smc.variables,
+-                sample_stats,
+-                smc.sample_settings(),
+-            ),
+-            protocol=-1,
+-        )
+-        self._msg_pipe.send(("done", result))
+-
+-
+-def _run_smc_process(*args):
+-    """Entry point for SMC process."""
+-    _SMCProcess(*args).run()
+-
+-
+-class SMCProcessAdapter:
+-    """Adapter to control an SMC process from the main thread."""
+-
+-    def __init__(
+-        self,
+-        kernel,
+-        chain: int,
+-        rng: np.random.Generator,
+-        start,
+-        mp_ctx,
+-        blas_cores: int | None,
+-    ):
+-        self.chain = chain
+-        process_name = f"smc_worker_chain_{chain}"
+-        self._msg_pipe, remote_conn = multiprocessing.Pipe()
+-
+-        self._process = mp_ctx.Process(
+-            daemon=True,
+-            name=process_name,
+-            target=_run_smc_process,
+-            args=(
+-                process_name,
+-                remote_conn,
+-                kernel,
+-                start,
+-                get_state_from_generator(rng),
+-                chain,
+-                mp_ctx.get_start_method(),
+-                blas_cores,
+-            ),
+-        )
+-        self._process.start()
+-        remote_conn.close()
+-
+-        self._current_stage = 0
+-        self._current_beta = 0.0
+-
+-    def _send(self, msg, *args):
+-        """Send message to the worker process."""
+-        try:
+-            self._msg_pipe.send((msg, *args))
+-        except Exception:
+-            message = None
+-            try:
+-                message = self._msg_pipe.recv()
+-            except Exception:
+-                pass
+-            if message is not None and message[0] == "error":
+-                old_error = message[1]
+-                if old_error is not None:
+-                    error = ParallelSamplingError(
+-                        f"Chain {self.chain} failed with: {old_error}", self.chain
+-                    )
+-                else:
+-                    error = RuntimeError(f"Chain {self.chain} failed.")
+-                raise error from old_error
+-            raise
+-
+-    def start(self):
+-        """Send start signal to the worker."""
+-        self._send("start")
+-
+-    def continue_sampling(self):
+-        """Send continue signal to the worker."""
+-        self._send("continue")
+-
+-    def abort(self):
+-        """Send abort signal to the worker."""
+-        self._send("abort")
+-
+-    def join(self, timeout=None):
+-        """Join the worker process."""
+-        self._process.join(timeout)
+-
+-    def terminate(self):
+-        """Terminate the worker process."""
+-        self._process.terminate()
+-
+-    @staticmethod
+-    def recv_message(processes, timeout=3600):
+-        """Receive a message from any of the worker processes."""
+-        if not processes:
+-            raise ValueError("No processes.")
+-        pipes = [proc._msg_pipe for proc in processes]
+-        ready = multiprocessing.connection.wait(pipes, timeout=timeout)
+-        if not ready:
+-            raise multiprocessing.TimeoutError("No message from samplers.")
+-        idxs = {id(proc._msg_pipe): proc for proc in processes}
+-        proc = idxs[id(ready[0])]
+-        msg = ready[0].recv()
+-
+-        if msg[0] == "error":
+-            old_error = msg[1]
+-            if old_error is not None:
+-                error = ParallelSamplingError(
+-                    f"Chain {proc.chain} failed with: {old_error}", proc.chain
+-                )
+-            else:
+-                error = RuntimeError(f"Chain {proc.chain} failed.")
+-            raise error from old_error
+-        elif msg[0] == "progress":
+-            proc._current_stage = msg[1]
+-            proc._current_beta = msg[2]
+-            return (proc, "progress", msg[1], msg[2])
+-        elif msg[0] == "done":
+-            stage, beta, tempered_posterior, var_info, variables, sample_stats, sample_settings = (
+-                cloudpickle.loads(msg[1])
+-            )
+-            return (
+-                proc,
+-                "done",
+-                stage,
+-                beta,
+-                tempered_posterior,
+-                var_info,
+-                variables,
+-                sample_stats,
+-                sample_settings,
+-            )
+-        else:
+-            raise ValueError("Sampler sent bad message: " + msg[0])
+-
+-    @staticmethod
+-    def terminate_all(processes, patience=2):
+-        """Terminate all worker processes."""
+-        for process in processes:
+-            try:
+-                process.abort()
+-            except Exception:
+-                pass
+-
+-        start_time = time.time()
+-        try:
+-            for process in processes:
+-                timeout = time.time() + patience - start_time
+-                if timeout < 0:
+-                    raise multiprocessing.TimeoutError()
+-                process.join(timeout)
+-        except multiprocessing.TimeoutError:
+-            logger.warning(
+-                "Chain processes did not terminate as expected. Terminating forcefully..."
+-            )
+-            for process in processes:
+-                process.terminate()
+-            for process in processes:
+-                process.join()
+-
+-
+-class ParallelSMCSampler:
+-    """Parallel sampler for SMC chains."""
+-
+-    def __init__(
+-        self,
+-        *,
+-        kernel: SMC_KERNEL,
+-        chains: int,
+-        cores: int,
+-        rngs: Sequence[np.random.Generator],
+-        start_points: list[dict[str, np.ndarray] | None],
+-        mp_ctx: multiprocessing.context.BaseContext,
+-        progressbar: bool = True,
+-        progressbar_theme: Theme | None = default_progress_theme,
+-        blas_cores: int | None = None,
+-    ):
+-        if any(len(arg) != chains for arg in [rngs, start_points]):
+-            raise ValueError(f"Number of rngs and start_points must be {chains}.")
+-
+-        self._kernel = kernel
+-        kernel_pickled = cloudpickle.dumps(kernel, protocol=-1)
+-        start_points_pickled = [
+-            cloudpickle.dumps(start, protocol=-1) if start is not None else None
+-            for start in start_points
+-        ]
+-
+-        self._samplers = [
+-            SMCProcessAdapter(
+-                kernel_pickled,
+-                chain,
+-                rng,
+-                start_pickled,
+-                mp_ctx,
+-                blas_cores,
+-            )
+-            for chain, rng, start_pickled in zip(range(chains), rngs, start_points_pickled)
+-        ]
+-
+-        self._inactive = self._samplers.copy()
+-        self._finished: list[SMCProcessAdapter] = []
+-        self._active: list[SMCProcessAdapter] = []
+-        self._max_active = cores
+-
+-        self._in_context = False
+-
+-        self._progressbar = progressbar
+-        self._progressbar_theme = progressbar_theme
+-        self._chains = chains
+-
+-    def _make_active(self):
+-        """Start inactive processes up to the maximum number of active processes."""
+-        while self._inactive and len(self._active) < self._max_active:
+-            proc = self._inactive.pop(0)
+-            proc.start()
+-            self._active.append(proc)
+-
+-    def __iter__(self):
+-        """Iterate over SMC results."""
+-        if not self._in_context:
+-            raise ValueError("Use ParallelSMCSampler as context manager.")
+-
+-        self._make_active()
+-
+-        with SMCProgressBarManager(
+-            kernel=self._kernel,
+-            chains=self._chains,
+-            progressbar=self._progressbar,
+-            progressbar_theme=self._progressbar_theme,
+-        ) as progress_manager:
+-            chain_betas = {proc.chain: 0.0 for proc in self._samplers}
+-
+-            while self._active:
+-                result = SMCProcessAdapter.recv_message(self._active, timeout=3600)
+-                proc = result[0]
+-                msg_type = result[1]
+-
+-                if msg_type == "progress":
+-                    stage, beta = result[2], result[3]
+-                    old_beta = chain_betas[proc.chain]
+-                    chain_betas[proc.chain] = beta
+-
+-                    progress_manager.update(proc.chain, stage, beta, old_beta)
+-                    proc.continue_sampling()
+-
+-                elif msg_type == "done":
+-                    (
+-                        stage,
+-                        beta,
+-                        tempered_posterior,
+-                        var_info,
+-                        variables,
+-                        sample_stats,
+-                        sample_settings,
+-                    ) = result[2:]
+-
+-                    progress_manager.update(proc.chain, stage, beta, is_last=True)
+-
+-                    proc.join()
+-                    self._active.remove(proc)
+-                    self._finished.append(proc)
+-                    self._make_active()
+-
+-                    yield SMCResult(
+-                        proc.chain,
+-                        True,
+-                        stage,
+-                        beta,
+-                        tempered_posterior,
+-                        var_info,
+-                        variables,
+-                        sample_stats,
+-                        sample_settings,
+-                    )
+-
+-    def __enter__(self):
+-        """Enter the context manager."""
+-        self._in_context = True
+-        return self
+-
+-    def __exit__(self, *args):
+-        """Exit the context manager."""
+-        SMCProcessAdapter.terminate_all(self._samplers)
+diff --git a/pymc/smc/sampling.py b/pymc/smc/sampling.py
+index deec9a457..249f6c525 100644
+--- a/pymc/smc/sampling.py
++++ b/pymc/smc/sampling.py
+@@ -13,32 +13,37 @@
+ #   limitations under the License.
+ 
+ import logging
++import multiprocessing
+ import time
+ 
++from collections import defaultdict
++from concurrent.futures import ProcessPoolExecutor, wait
+ from typing import Any
+ 
++import cloudpickle
+ import numpy as np
+ 
+ from arviz import InferenceData
+-from rich.theme import Theme
++from rich.progress import (
++    SpinnerColumn,
++    TextColumn,
++    TimeElapsedColumn,
++    TimeRemainingColumn,
++)
+ 
+ import pymc
+ 
+ from pymc.backends.arviz import dict_to_dataset, to_inference_data
+ from pymc.backends.base import MultiTrace
++from pymc.distributions.custom import CustomDistRV, CustomSymbolicDistRV
++from pymc.distributions.distribution import _support_point
++from pymc.logprob.abstract import _icdf, _logcdf, _logprob
+ from pymc.model import Model, modelcontext
+-from pymc.progress_bar import SMCProgressBarManager, default_progress_theme
+-from pymc.sampling.mcmc import setup_cores_blas_cores
+-from pymc.sampling.parallel import _cpu_count, _initialize_multiprocessing_context
++from pymc.progress_bar import CustomProgress
++from pymc.sampling.parallel import _cpu_count
+ from pymc.smc.kernels import IMH
+-from pymc.smc.parallel import ParallelSMCSampler
+ from pymc.stats.convergence import log_warnings, run_convergence_checks
+-from pymc.util import (
+-    RandomState,
+-    _get_seeds_per_chain,
+-)
+-
+-logger = logging.getLogger(__name__)
++from pymc.util import RandomState, _get_seeds_per_chain
+ 
+ 
+ def sample_smc(
+@@ -50,14 +55,11 @@ def sample_smc(
+     random_seed: RandomState = None,
+     chains=None,
+     cores=None,
+-    blas_cores: int | str | None = None,
+     compute_convergence_checks=True,
+     return_inferencedata=True,
+     idata_kwargs=None,
+     progressbar=True,
+-    progressbar_theme: Theme | None = default_progress_theme,
+     compile_kwargs: dict | None = None,
+-    mp_ctx=None,
+     **kernel_kwargs,
+ ) -> InferenceData | MultiTrace:
+     r"""
+@@ -85,13 +87,6 @@ def sample_smc(
+     cores : int, default None
+         The number of chains to run in parallel. If ``None``, set to the number of CPUs in the
+         system.
+-    blas_cores: int or "auto" or None, default = "auto"
+-        The total number of threads blas and openmp functions should use during sampling.
+-        Setting it to "auto" will ensure that the total number of active blas threads is the
+-        same as the `cores` argument. If set to an integer, the sampler will try to use that total
+-        number of blas threads. If `blas_cores` is not divisible by `cores`, it might get rounded
+-        down. If set to None, this will keep the default behavior of whatever blas implementation
+-        is used at runtime.
+     compute_convergence_checks : bool, default True
+         Whether to compute sampler statistics like ``R hat`` and ``effective_n``.
+         Defaults to ``True``.
+@@ -102,14 +97,8 @@ def sample_smc(
+         Keyword arguments for :func:`pymc.to_inference_data`.
+     progressbar : bool, optional, default True
+         Whether or not to display a progress bar in the command line.
+-    progressbar_theme : Theme, optional
+-        Custom theme for progress bar. Defaults to the standard PyMC progress bar theme.
+     compile_kwargs: dict, optional
+         Keyword arguments to pass to pytensor.function
+-    mp_ctx : multiprocessing.context or str, optional
+-        Multiprocessing context for parallel chains. Can be a context object or a string
+-        ("fork", "spawn", or "forkserver"). If None, defaults to "fork" on macOS ARM and
+-        "forkserver" on other macOS systems, and the system default elsewhere.
+ 
+     **kernel_kwargs : dict, optional
+         Keyword arguments passed to the SMC_kernel. The default IMH kernel takes the following keywords:
+@@ -186,105 +175,29 @@ def sample_smc(
+ 
+     model = modelcontext(model)
+ 
+-    logger.info("Initializing SMC sampler...")
++    _log = logging.getLogger(__name__)
++    _log.info("Initializing SMC sampler...")
++    _log.info(
++        f"Sampling {chains} chain{'s' if chains > 1 else ''} "
++        f"in {cores} job{'s' if cores > 1 else ''}"
++    )
+ 
+-    mp_ctx = _initialize_multiprocessing_context(mp_ctx)
+-    joined_blas_limiter, cores, num_blas_cores_per_worker = setup_cores_blas_cores(
+-        blas_cores, chains, cores, mp_ctx
++    params = (
++        draws,
++        kernel,
++        start,
++        model,
+     )
+ 
+     t1 = time.time()
+ 
+-    rngs = [np.random.default_rng(seed) for seed in random_seed]
+-
+-    with model:
+-        smc_kernel = kernel(
+-            draws=draws,
+-            start=None,
+-            model=model,
+-            random_seed=rngs[0].integers(2**30),
+-            **kernel_kwargs,
+-        )
+-
+-    # Prepare start points for each chain
+-    start_points: list[dict | None]
+-    if start is None:
+-        start_points = [None] * chains
+-    elif isinstance(start, dict):
+-        start_points = [start] * chains
+-    else:
+-        if len(start) != chains:
+-            raise ValueError(f"Number of start dicts must match number of chains ({chains})")
+-        start_points = start
+-
+-    parallel = cores > 1 and chains > 1
+-
+-    traces = []
+-    sample_stats = []
+-    sample_settings = []
++    results = run_chains(chains, progressbar, params, random_seed, kernel_kwargs, cores)
+ 
+-    if parallel:
+-        logger.info(
+-            f"Sampling {chains} chain{'s' if chains > 1 else ''} "
+-            f"in {cores} job{'s' if cores > 1 else ''}"
+-        )
+-
+-        results = []
+-        with joined_blas_limiter():
+-            with ParallelSMCSampler(
+-                kernel=smc_kernel,
+-                chains=chains,
+-                cores=cores,
+-                rngs=rngs,
+-                start_points=start_points,
+-                progressbar=progressbar,
+-                progressbar_theme=progressbar_theme,
+-                mp_ctx=mp_ctx,
+-                blas_cores=num_blas_cores_per_worker,
+-            ) as sampler:
+-                for result in sampler:
+-                    results.append(result)
+-
+-        chain_results: list[list] = [[] for _ in range(chains)]
+-        for result in results:
+-            chain_results[result.chain].append(result)
+-
+-        for chain_idx, chain_samples in enumerate(chain_results):
+-            if not chain_samples:
+-                raise RuntimeError(
+-                    f"Chain {chain_idx} did not produce any results. "
+-                    "This indicates a failure in parallel sampling."
+-                )
+-            final_result = chain_samples[-1]
+-            trace = _build_trace_from_kernel_state(
+-                final_result.tempered_posterior,
+-                final_result.var_info,
+-                final_result.variables,
+-                chain_idx,
+-                model,
+-            )
+-            traces.append(trace)
+-
+-            sample_stats.append(final_result.sample_stats)
+-            sample_settings.append(final_result.sample_settings)
+-
+-    else:
+-        logger.info(
+-            f"Sampling {chains} chain{'s' if chains > 1 else ''}{' sequentially' if chains > 1 else ''}"
+-        )
+-        with joined_blas_limiter():
+-            _sample_smc_sequentially(
+-                kernel=smc_kernel,
+-                chains=chains,
+-                rngs=rngs,
+-                start_points=start_points,
+-                model=model,
+-                progressbar=progressbar,
+-                progressbar_theme=progressbar_theme,
+-                traces=traces,
+-                sample_stats=sample_stats,
+-                sample_settings=sample_settings,
+-            )
++    (
++        traces,
++        sample_stats,
++        sample_settings,
++    ) = zip(*results)
+ 
+     trace = MultiTrace(traces)
+ 
+@@ -366,132 +279,157 @@ def _save_sample_stats(
+     return sample_stats, idata
+ 
+ 
+-def _build_trace_from_kernel_state(
+-    tempered_posterior: np.ndarray,
+-    var_info: dict,
+-    variables: list,
+-    chain: int,
+-    model: Model,
++def _sample_smc_int(
++    draws,
++    kernel,
++    start,
++    model,
++    random_seed,
++    chain,
++    progress_dict,
++    task_id,
++    **kernel_kwargs,
+ ):
+-    """Build a trace from kernel state.
++    """Run one SMC instance."""
++    in_out_pickled = isinstance(model, bytes)
++    if in_out_pickled:
++        # function was called in multiprocessing context, deserialize first
++        (draws, kernel, start, model) = map(
++            cloudpickle.loads,
++            (
++                draws,
++                kernel,
++                start,
++                model,
++            ),
++        )
+ 
+-    This allows trace building to happen in the main process rather than workers.
++        kernel_kwargs = {key: cloudpickle.loads(value) for key, value in kernel_kwargs.items()}
+ 
+-    Parameters
+-    ----------
+-    tempered_posterior : ndarray
+-        The final particle positions
+-    var_info : dict
+-        Dictionary of variable info {var.name: (shape, size)}
+-    variables : list
+-        List of model variables
+-    chain : int
+-        Chain index
+-    model : Model
+-        PyMC model for trace setup
+-
+-    Returns
+-    -------
+-    NDArray trace backend
+-    """
+-    from pymc.backends.ndarray import NDArray
+-    from pymc.vartypes import discrete_types
++    smc = kernel(
++        draws=draws,
++        start=start,
++        model=model,
++        random_seed=random_seed,
++        **kernel_kwargs,
++    )
+ 
+-    length_pos = len(tempered_posterior)
+-    varnames = [v.name for v in variables]
++    smc._initialize_kernel()
++    smc.setup_kernel()
+ 
+-    strace = NDArray(name=model.name, model=model)
+-    strace.setup(length_pos, chain)
++    stage = 0
++    sample_stats = defaultdict(list)
++    while smc.beta < 1:
++        smc.update_beta_and_weights()
+ 
+-    for i in range(length_pos):
+-        value = []
+-        size = 0
+-        for var in variables:
+-            shape, new_size = var_info[var.name]
+-            var_samples = tempered_posterior[i][size : size + new_size]
+-            # Round discrete variable samples
+-            if var.dtype in discrete_types:
+-                var_samples = np.round(var_samples).astype(var.dtype)
+-            value.append(var_samples.reshape(shape))
+-            size += new_size
+-        strace.record(point=dict(zip(varnames, value)))
++        progress_dict[task_id] = {"stage": stage, "beta": smc.beta}
+ 
+-    return strace
++        smc.resample()
++        smc.tune()
++        smc.mutate()
++        for stat, value in smc.sample_stats().items():
++            sample_stats[stat].append(value)
+ 
++        stage += 1
+ 
+-def _sample_smc_sequentially(
+-    *,
+-    kernel,
+-    chains: int,
+-    rngs: list[np.random.Generator],
+-    start_points: list[dict | None],
+-    model: Model,
+-    progressbar: bool,
+-    progressbar_theme: Theme | None,
+-    traces: list,
+-    sample_stats: list,
+-    sample_settings: list,
+-):
+-    """Sample all SMC chains sequentially.
++    results = (
++        smc._posterior_to_trace(chain),
++        sample_stats,
++        smc.sample_settings(),
++    )
+ 
+-    Parameters
+-    ----------
+-    kernel: SMC_KERNEL instance
+-        An initialized SMC kernel (with compiled functions)
+-    chains: int
+-        Total number of chains to sample
+-    rngs: list of random Generators
+-        A list of random number generators, one for each chain
+-    start_points: list
+-        Starting points for each chain
+-    model: Model
+-        The PyMC model
+-    progressbar: bool
+-        Whether to show progress bar
+-    progressbar_theme: Theme
+-        Progress bar theme
+-    traces: list
+-        List to append trace results to
+-    sample_stats: list
+-        List to append sample_stats to
+-    sample_settings: list
+-        List to append sample_settings to
+-    """
+-    with SMCProgressBarManager(
+-        kernel=kernel,
+-        chains=chains,
+-        progressbar=progressbar,
+-        progressbar_theme=progressbar_theme,
+-    ) as progress_manager:
+-        for i in range(chains):
+-            kernel.initialize(start_points[i], rngs[i])
+-
+-            stage = 0
+-            chain_sample_stats: dict[str, list] = {stat: [] for stat in kernel.stats_dtypes_shapes}
+-
+-            while kernel.beta < 1:
+-                old_beta = kernel.beta
+-                kernel.update_beta_and_weights()
+-
+-                progress_manager.update(
+-                    chain_idx=i, stage=stage, beta=kernel.beta, old_beta=old_beta, is_last=False
+-                )
+-
+-                for stat, value in kernel.step().items():
+-                    chain_sample_stats[stat].append(value)
+-
+-                stage += 1
+-
+-            progress_manager.update(chain_idx=i, stage=stage, beta=kernel.beta, is_last=True)
+-
+-            trace = _build_trace_from_kernel_state(
+-                tempered_posterior=kernel.tempered_posterior,
+-                var_info=kernel.var_info,
+-                variables=kernel.variables,
+-                chain=i,
+-                model=model,
++    if in_out_pickled:
++        results = cloudpickle.dumps(results)
++
++    return results
++
++
++def run_chains(chains, progressbar, params, random_seed, kernel_kwargs, cores):
++    with CustomProgress(
++        TextColumn("{task.description}"),
++        SpinnerColumn(),
++        TimeRemainingColumn(),
++        TextColumn("/"),
++        TimeElapsedColumn(),
++        TextColumn("{task.fields[status]}"),
++        disable=not progressbar,
++    ) as progress:
++        futures = []  # keep track of the jobs
++        with multiprocessing.Manager() as manager:
++            # this is the key - we share some state between our
++            # main process and our worker functions
++            _progress = manager.dict()
++
++            # check if model contains CustomDistributions defined without dist argument
++            custom_methods = _find_custom_dist_dispatch_methods(params[3])
++
++            # "manually" (de)serialize params before/after multiprocessing
++            params = tuple(cloudpickle.dumps(p) for p in params)
++            kernel_kwargs = {key: cloudpickle.dumps(value) for key, value in kernel_kwargs.items()}
++
++            with ProcessPoolExecutor(
++                max_workers=cores,
++                initializer=_register_custom_methods,
++                initargs=(custom_methods,),
++            ) as executor:
++                for c in range(chains):  # iterate over the jobs we need to run
++                    # set visible false so we don't have a lot of bars all at once:
++                    task_id = progress.add_task(f"Chain {c}", status="Stage: 0 Beta: 0")
++                    futures.append(
++                        executor.submit(
++                            _sample_smc_int,
++                            *params,
++                            random_seed[c],
++                            c,
++                            _progress,
++                            task_id,
++                            **kernel_kwargs,
++                        )
++                    )
++
++                # monitor the progress:
++                done = []
++                remaining = futures
++                while len(remaining) > 0:
++                    finished, remaining = wait(remaining, timeout=0.1)
++                    done.extend(finished)
++                    for task_id, update_data in _progress.items():
++                        stage = update_data["stage"]
++                        beta = update_data["beta"]
++                        # update the progress bar for this task:
++                        progress.update(
++                            status=f"Stage: {stage} Beta: {beta:.3f}",
++                            task_id=task_id,
++                            refresh=True,
++                        )
++
++        return tuple(cloudpickle.loads(r.result()) for r in done)
++
++
++def _find_custom_dist_dispatch_methods(model):
++    custom_methods = {}
++    for rv in model.basic_RVs:
++        rv_type = rv.owner.op
++        cls = type(rv_type)
++        if isinstance(rv_type, CustomDistRV | CustomSymbolicDistRV):
++            custom_methods[cloudpickle.dumps(cls)] = (
++                cloudpickle.dumps(_logprob.registry.get(cls, None)),
++                cloudpickle.dumps(_logcdf.registry.get(cls, None)),
++                cloudpickle.dumps(_icdf.registry.get(cls, None)),
++                cloudpickle.dumps(_support_point.registry.get(cls, None)),
+             )
+ 
+-            traces.append(trace)
+-            sample_stats.append(chain_sample_stats)
+-            sample_settings.append(kernel.sample_settings())
++    return custom_methods
++
++
++def _register_custom_methods(custom_methods):
++    for cls, (logprob, logcdf, icdf, support_point) in custom_methods.items():
++        cls = cloudpickle.loads(cls)
++        if logprob is not None:
++            _logprob.register(cls, cloudpickle.loads(logprob))
++        if logcdf is not None:
++            _logcdf.register(cls, cloudpickle.loads(logcdf))
++        if icdf is not None:
++            _icdf.register(cls, cloudpickle.loads(icdf))
++        if support_point is not None:
++            _support_point.register(cls, cloudpickle.loads(support_point))
+diff --git a/tests/progress_bar/test_manager.py b/tests/progress_bar/test_manager.py
+index 67b9f17cc..b285b9387 100644
+--- a/tests/progress_bar/test_manager.py
++++ b/tests/progress_bar/test_manager.py
+@@ -16,7 +16,7 @@ import pytest
+ 
+ import pymc as pm
+ 
+-from pymc.progress_bar import MCMCProgressBarManager
++from pymc.progress_bar import ProgressBarManager
+ 
+ 
+ def test_progressbar_nested_compound():
+@@ -58,7 +58,7 @@ class TestProgressBarManagerConfiguration:
+         return step
+ 
+     def test_init_split_mode(self, step_method):
+-        manager = MCMCProgressBarManager(
++        manager = ProgressBarManager(
+             step_method=step_method,
+             chains=2,
+             draws=100,
+@@ -72,7 +72,7 @@ class TestProgressBarManagerConfiguration:
+         assert manager.total_draws == 150
+ 
+     def test_init_combined_mode(self, step_method):
+-        manager = MCMCProgressBarManager(
++        manager = ProgressBarManager(
+             step_method=step_method,
+             chains=2,
+             draws=100,
+@@ -83,7 +83,7 @@ class TestProgressBarManagerConfiguration:
+         assert manager.full_stats is False
+ 
+     def test_init_combined_stats_mode(self, step_method):
+-        manager = MCMCProgressBarManager(
++        manager = ProgressBarManager(
+             step_method=step_method,
+             chains=2,
+             draws=100,
+@@ -94,7 +94,7 @@ class TestProgressBarManagerConfiguration:
+         assert manager.full_stats is True
+ 
+     def test_init_split_stats_mode(self, step_method):
+-        manager = MCMCProgressBarManager(
++        manager = ProgressBarManager(
+             step_method=step_method,
+             chains=2,
+             draws=100,
+@@ -105,7 +105,7 @@ class TestProgressBarManagerConfiguration:
+         assert manager.full_stats is True
+ 
+     def test_init_disabled(self, step_method):
+-        manager = MCMCProgressBarManager(
++        manager = ProgressBarManager(
+             step_method=step_method,
+             chains=2,
+             draws=100,
+@@ -116,7 +116,7 @@ class TestProgressBarManagerConfiguration:
+ 
+     def test_invalid_progressbar_value(self, step_method):
+         with pytest.raises(ValueError, match="Invalid value for `progressbar`"):
+-            MCMCProgressBarManager(
++            ProgressBarManager(
+                 step_method=step_method,
+                 chains=2,
+                 draws=100,
+diff --git a/tests/progress_bar/test_marimo.py b/tests/progress_bar/test_marimo.py
+index 8178dfbd3..d641d312c 100644
+--- a/tests/progress_bar/test_marimo.py
++++ b/tests/progress_bar/test_marimo.py
+@@ -18,7 +18,7 @@ import pytest
+ 
+ import pymc as pm
+ 
+-from pymc.progress_bar import MCMCProgressBarManager
++from pymc.progress_bar import ProgressBarManager
+ from pymc.progress_bar.marimo_progress import MarimoProgressBackend
+ 
+ 
+@@ -36,7 +36,7 @@ class TestMarimoProgressBackend:
+ 
+     def test_init_split_mode(self, step_method):
+         with patch("pymc.progress_bar.progress.in_marimo_notebook", return_value=True):
+-            manager = MCMCProgressBarManager(
++            manager = ProgressBarManager(
+                 step_method=step_method,
+                 chains=2,
+                 draws=100,
+@@ -47,7 +47,7 @@ class TestMarimoProgressBackend:
+ 
+     def test_init_combined_mode(self, step_method):
+         with patch("pymc.progress_bar.progress.in_marimo_notebook", return_value=True):
+-            manager = MCMCProgressBarManager(
++            manager = ProgressBarManager(
+                 step_method=step_method,
+                 chains=2,
+                 draws=100,
+@@ -60,7 +60,7 @@ class TestMarimoProgressBackend:
+ 
+     def test_render_html_structure(self, step_method):
+         with patch("pymc.progress_bar.progress.in_marimo_notebook", return_value=True):
+-            manager = MCMCProgressBarManager(
++            manager = ProgressBarManager(
+                 step_method=step_method,
+                 chains=2,
+                 draws=100,
+@@ -71,8 +71,8 @@ class TestMarimoProgressBackend:
+             assert isinstance(manager._backend, MarimoProgressBackend)
+ 
+             backend._chain_state = [
+-                {"completed": 50, "total": 150, "failing": False, "stats": {}},
+-                {"completed": 75, "total": 150, "failing": True, "stats": {"divergences": 1}},
++                {"draws": 50, "total": 150, "failing": False, "stats": {}},
++                {"draws": 75, "total": 150, "failing": True, "stats": {"divergences": 1}},
+             ]
+             backend._start_times = [0, 0]
+ 
+@@ -84,7 +84,7 @@ class TestMarimoProgressBackend:
+ 
+     def test_render_html_with_stats(self, step_method):
+         with patch("pymc.progress_bar.progress.in_marimo_notebook", return_value=True):
+-            manager = MCMCProgressBarManager(
++            manager = ProgressBarManager(
+                 step_method=step_method,
+                 chains=1,
+                 draws=100,
+@@ -94,9 +94,9 @@ class TestMarimoProgressBackend:
+             backend = manager._backend
+             assert isinstance(manager._backend, MarimoProgressBackend)
+ 
+-            backend._task_state = [
++            backend._chain_state = [
+                 {
+-                    "completed": 50,
++                    "draws": 50,
+                     "total": 150,
+                     "failing": False,
+                     "stats": {"step_size": 0.25, "divergences": 0},
+diff --git a/tests/smc/test_smc.py b/tests/smc/test_smc.py
+index 9ee7a3904..493c0c8da 100644
+--- a/tests/smc/test_smc.py
++++ b/tests/smc/test_smc.py
+@@ -12,6 +12,7 @@
+ #   See the License for the specific language governing permissions and
+ #   limitations under the License.
+ import logging
++import platform
+ import warnings
+ 
+ import numpy as np
+@@ -20,7 +21,6 @@ import pytest
+ import scipy.stats as st
+ 
+ from arviz.data.inference_data import InferenceData
+-from pytensor.compile.ops import wrap_py
+ 
+ import pymc as pm
+ 
+@@ -30,6 +30,8 @@ from pymc.pytensorf import floatX
+ from pymc.smc.kernels import IMH, systematic_resampling
+ from tests.helpers import assert_random_state_equal
+ 
++_IS_WINDOWS = platform.system() == "Windows"
++
+ 
+ class TestSMC:
+     """Tests for the default SMC kernel"""
+@@ -74,12 +76,11 @@ class TestSMC:
+             x = pm.Normal("x", 0, 1)
+             y = pm.Normal("y", x, 1, observed=0)
+ 
+-    @pytest.mark.parametrize("cores", [1, 2], ids=["sequential", "parallel"])
+-    def test_sample(self, cores):
++    def test_sample(self):
+         initial_rng_state = np.random.get_state()
+         with self.SMC_test:
+             mtrace = pm.sample_smc(
+-                draws=self.samples, return_inferencedata=False, chains=2, cores=cores
++                draws=self.samples, return_inferencedata=False, progressbar=not _IS_WINDOWS
+             )
+ 
+         # Verify sampling was done with a non-global random generator
+@@ -162,7 +163,9 @@ class TestSMC:
+             with pm.Model() as model:
+                 a = pm.Beta("a", alpha, beta)
+                 y = pm.Bernoulli("y", a, observed=data)
+-                trace = pm.sample_smc(2000, chains=2, return_inferencedata=False)
++                trace = pm.sample_smc(
++                    2000, chains=2, return_inferencedata=False, progressbar=not _IS_WINDOWS
++                )
+             # log_marginal_likelihood is found in the last value of each chain
+             lml = np.mean([chain[-1] for chain in trace.report.log_marginal_likelihood])
+             marginals.append(lml)
+@@ -223,12 +226,14 @@ class TestSMC:
+             with warnings.catch_warnings():
+                 warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
+                 warnings.filterwarnings("ignore", "More chains .* than draws .*", UserWarning)
+-                idata = pm.sample_smc(chains=chains, draws=draws, progressbar=not (chains > 1))
++                idata = pm.sample_smc(
++                    chains=chains, draws=draws, progressbar=not (chains > 1 and _IS_WINDOWS)
++                )
+                 mt = pm.sample_smc(
+                     chains=chains,
+                     draws=draws,
+                     return_inferencedata=False,
+-                    progressbar=not (chains > 1),
++                    progressbar=not (chains > 1 and _IS_WINDOWS),
+                 )
+ 
+         assert isinstance(idata, InferenceData)
+@@ -243,7 +248,7 @@ class TestSMC:
+     def test_convergence_checks(self, caplog):
+         with caplog.at_level(logging.INFO):
+             with self.fast_model:
+-                pm.sample_smc(draws=99)
++                pm.sample_smc(draws=99, progressbar=not _IS_WINDOWS)
+         assert "The number of samples is too small" in caplog.text
+ 
+     def test_ordered(self):
+@@ -280,7 +285,7 @@ class TestMHKernel:
+             mu = pm.Normal("mu", 0, 3)
+             sigma = pm.HalfNormal("sigma", 1)
+             y = pm.Normal("y", mu, sigma, observed=data)
+-            idata = pm.sample_smc(draws=2000, kernel=pm.smc.MH)
++            idata = pm.sample_smc(draws=2000, kernel=pm.smc.MH, progressbar=not _IS_WINDOWS)
+         assert_random_state_equal(initial_rng_state, np.random.get_state())
+ 
+         post = idata.posterior.stack(sample=("chain", "draw"))
+@@ -307,22 +312,3 @@ def test_systematic():
+     np.testing.assert_array_equal(systematic_resampling(weights, rng), [0, 1, 2])
+     weights = [0.99, 0.01]
+     np.testing.assert_array_equal(systematic_resampling(weights, rng), [0, 0])
+-
+-
+-@wrap_py(itypes=[pt.dvector], otypes=[pt.dvector])
+-def _twice(x):
+-    # Pickle fails if this is defined inside the test function namespace.
+-    return 2 * x
+-
+-
+-def test_smc_with_custom_op():
+-    # Regression test for https://github.com/pymc-devs/pymc/issues/7078
+-
+-    with pm.Model() as model:
+-        x = pm.Normal("x", mu=[0, 0], sigma=1)
+-        y = _twice(x)
+-        pm.Normal(name="z", mu=y, observed=[1, 1])
+-
+-        trace = pm.sample_smc(10, cores=2, chains=2)
+-
+-    assert trace is not None
